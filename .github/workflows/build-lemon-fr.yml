@@ -74,7 +74,7 @@ jobs:
                   '        assert_eq!((find_check("Main GUI scaling"), find_check("")), (None, None));\n        assert_eq!(find_combo("Language"), Some(&UI_LANGUAGE));')
               replace_once('crates/os-app/src/views/settings.rs',
                   '                combo("English (US) (en)", 176.0, "Language"),',
-                  '                combo(p::choice(&p::UI_LANGUAGE), 176.0, p::UI_LANGUAGE.label),')
+                  '                combo(crate::prefs::choice(&crate::prefs::UI_LANGUAGE), 176.0, crate::prefs::UI_LANGUAGE.label),,')
               replace_once('crates/os-app/src/main.rs',
                   '    app::move_old_settings();\n',
                   '    app::move_old_settings();\n    os_ui::locale::set_french(prefs::index(&prefs::UI_LANGUAGE) == 1);\n')
