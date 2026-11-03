@@ -1525,7 +1525,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name Lemon-Studio-Compositeur-Grooves-IA lemon_ai_composer.py
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name Lemon-Studio-Compositeur-Audio-IA lemon_ai_composer.py
           if (-not (Test-Path 'dist\Lemon-Studio-Compositeur-Audio-IA.exe')) { throw 'Executable assistant non trouve' }
           if (-not (Test-Path 'Lemon-Studio-FR-Audio\lemonstudio.exe')) { throw 'Executable Lemon Studio FR non trouve' }
           Copy-Item 'dist\Lemon-Studio-Compositeur-Audio-IA.exe' 'Lemon-Studio-FR-Audio\Lemon-Studio-Compositeur-Audio-IA.exe'
