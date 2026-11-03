@@ -78,6 +78,10 @@ jobs:
               replace_once('crates/os-app/src/main.rs',
                   '    app::move_old_settings();\n',
                   '    app::move_old_settings();\n    os_ui::locale::set_french(prefs::index(&prefs::UI_LANGUAGE) == 1);\n')
+                  
+              replace_once('crates/os-app/src/views/menus.rs',
+                  '    const X: [f32; 8] = [8.0, 35.0, 61.0, 88.0, 143.0, 176.0, 226.0, 266.0];',
+                  '    const X: [f32; 8] = [8.0, 43.0, 78.0, 113.0, 146.0, 196.0, 235.0, 267.0];')
               print('Lemon Studio: language switch and translation dictionary patched successfully.')
           
           
