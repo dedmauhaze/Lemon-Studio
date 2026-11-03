@@ -1,0 +1,112 @@
+name: Lemon Studio FR - Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lemon-fr.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-fr:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Ajouter le selecteur de langue et le dictionnaire FR
+        shell: pwsh
+        run: |
+          @'
+          #!/usr/bin/env python3
+          """Non-destructive source patch: add an opt-in EN/FR UI layer to Lemon Studio.
+          Apply AFTER checkout of the exact baseline this script targets.
+          Only visible labels are translated; internal command IDs and user project data stay unchanged.
+          """
+          from pathlib import Path
+          
+          ROOT = Path(__file__).resolve().parent
+          # This script is designed to run from the repository root.
+          
+          
+          def replace_once(path, old, new):
+              p = ROOT / path
+              src = p.read_text(encoding='utf-8')
+              count = src.count(old)
+              if count != 1:
+                  raise RuntimeError(f'{path}: expected exactly one match, got {count}: {old[:100]!r}')
+              p.write_text(src.replace(old, new, 1), encoding='utf-8')
+          
+          
+          LOCALE_RS = '// French interface prototype for Lemon Studio. This file is injected by patch_lemon_fr.py.\n// English remains unchanged and French translations cover a selected UI subset.\nuse std::borrow::Cow;\nuse std::sync::atomic::{AtomicBool, Ordering};\n\nstatic FRENCH: AtomicBool = AtomicBool::new(true);\n\npub fn set_french(on: bool) {\n    FRENCH.store(on, Ordering::Relaxed);\n}\n\npub fn translate(input: &str) -> Cow<\'_, str> {\n    if !FRENCH.load(Ordering::Relaxed) {\n        return Cow::Borrowed(input);\n    }\n    let value: &\'static str = match input {\n        "ADD" => "AJOUTER",\n        "About" => "À propos",\n        "About..." => "À propos…",\n        "Add" => "Ajouter",\n        "Add folder..." => "Ajouter un dossier…",\n        "Advanced" => "Avancé",\n        "Alternate meter scale" => "Échelle alternative des vu-mètres",\n        "Alternate undo mode" => "Mode d’annulation alternatif",\n        "Animation refresh rate" => "Fréquence des animations",\n        "Arrange windows" => "Organiser les fenêtres",\n        "Arranger" => "Arrangeur",\n        "Audio" => "Audio",\n        "Audio clip" => "Clip audio",\n        "Audio clip channels" => "Canaux de clips audio",\n        "Audio recording" => "Enregistrement audio",\n        "Audio settings" => "Paramètres audio",\n        "Auto scrolling" => "Défilement automatique",\n        "Auto zoom in piano roll" => "Zoom automatique dans le piano roll",\n        "Auto-collapse empty channels" => "Réduire automatiquement les canaux vides",\n        "Automatically check for updates" => "Vérifier automatiquement les mises à jour",\n        "Automatically download program updates" => "Télécharger automatiquement les mises à jour",\n        "Automation clip" => "Clip d’automatisation",\n        "Background" => "Arrière-plan",\n        "Black notes" => "Touches noires",\n        "Blend recorded notes" => "Fusionner les notes enregistrées",\n        "Browse plugin library" => "Parcourir la bibliothèque de plugins",\n        "Browse presets" => "Parcourir les presets",\n        "Browser" => "Explorateur",\n        "Buffer length" => "Taille du tampon",\n        "CPU" => "Processeur",\n        "Cancel" => "Annuler",\n        "Change color..." => "Changer la couleur…",\n        "Channel" => "Canal",\n        "Channel rack" => "Rack de canaux",\n        "Channels" => "Canaux",\n        "Click-and-hold gestures" => "Gestes cliquer-maintenir",\n        "Clock" => "Horloge",\n        "Clone" => "Dupliquer",\n        "Close" => "Fermer",\n        "Close all plugin windows" => "Fermer toutes les fenêtres de plugins",\n        "Close all windows" => "Fermer toutes les fenêtres",\n        "Colorful waveforms" => "Formes d’onde colorées",\n        "Combine formats of the same plugin" => "Regrouper les formats du même plugin",\n        "Copy" => "Copier",\n        "Count-in" => "Décompte",\n        "Current project" => "Projet actuel",\n        "Cursors scaling" => "Échelle des curseurs",\n        "Cut" => "Couper",\n        "Debug" => "Débogage",\n        "Debugging log" => "Journal de débogage",\n        "Default template" => "Modèle par défaut",\n        "Delete" => "Supprimer",\n        "Diagnostics" => "Diagnostics",\n        "Disabled" => "Désactivé",\n        "Display" => "Affichage",\n        "Done" => "Terminé",\n        "EDIT" => "ÉDITION",\n        "Edit" => "Éditer",\n        "Effect" => "Effet",\n        "Effects" => "Effets",\n        "Effects in use" => "Effets utilisés",\n        "Empty" => "Vide",\n        "Enable" => "Activer",\n        "Enabled" => "Activé",\n        "Exclusive" => "Exclusif",\n        "Exit" => "Quitter",\n        "Export" => "Exporter",\n        "Export MIDI..." => "Exporter en MIDI…",\n        "Export audio..." => "Exporter l’audio…",\n        "External sync" => "Synchronisation externe",\n        "FILE" => "FICHIER",\n        "Fast sample preview" => "Préécoute rapide des samples",\n        "File" => "Fichier",\n        "File settings" => "Paramètres de fichiers",\n        "Files & folders" => "Fichiers et dossiers",\n        "Find" => "Chercher",\n        "Find..." => "Chercher…",\n        "Fix text" => "Corriger le texte",\n        "General" => "Général",\n        "General settings" => "Paramètres généraux",\n        "Generators" => "Générateurs",\n        "HELP" => "AIDE",\n        "Help" => "Aide",\n        "Help index" => "Index de l’aide",\n        "Hide plugin window strip by default" => "Masquer la barre des fenêtres de plugins par défaut",\n        "High visibility" => "Visibilité renforcée",\n        "Hints and warnings" => "Conseils et avertissements",\n        "History" => "Historique",\n        "Horizontal scrolling speed" => "Vitesse de défilement horizontal",\n        "Import" => "Importer",\n        "Info" => "Informations",\n        "Input" => "Entrée",\n        "Input device" => "Périphérique d’entrée",\n        "Insert one" => "Insérer un",\n        "Instrument" => "Instrument",\n        "Instrument rack" => "Rack d’instruments",\n        "Instruments" => "Instruments",\n        "Instruments in use" => "Instruments utilisés",\n        "Language" => "Langue",\n        "Layer" => "Calque",\n        "Layout" => "Disposition",\n        "Legacy scaling" => "Échelle de compatibilité",\n        "Load theme..." => "Charger un thème…",\n        "Look and feel" => "Apparence",\n        "Loop record" => "Enregistrement en boucle",\n        "MIDI" => "MIDI",\n        "MIDI settings" => "Paramètres MIDI",\n        "Main GUI scaling" => "Échelle de l’interface",\n        "Main volume" => "Volume général",\n        "Manage messages" => "Gérer les messages",\n        "Manage plugins" => "Gérer les plugins",\n        "Manage shortcuts" => "Gérer les raccourcis",\n        "Maximum undo levels" => "Nombre maximal d’annulations",\n        "Metronome" => "Métronome",\n        "Miscellaneous" => "Divers",\n        "Mixer" => "Mixeur",\n        "Mixer track" => "Piste du mixeur",\n        "Mode" => "Mode",\n        "Mono" => "Mono",\n        "Move down" => "Descendre",\n        "Move undone recordings to the trash" => "Déplacer les enregistrements annulés dans la corbeille",\n        "Move up" => "Monter",\n        "Multithreaded instrument processing" => "Traitement multithread des instruments",\n        "Multithreaded mixer processing" => "Traitement multithread du mixeur",\n        "Name" => "Nom",\n        "Name channels after their sample or plugin" => "Nommer les canaux selon leur sample ou plugin",\n        "Name effect slots after their plugin" => "Nommer les emplacements d’effets selon leur plugin",\n        "New" => "Nouveau",\n        "New empty pattern..." => "Nouveau motif vide…",\n        "New from template" => "Nouveau depuis un modèle",\n        "New pattern" => "Nouveau motif",\n        "Next empty pattern..." => "Motif vide suivant…",\n        "No registration, no online services, no usage data." => "Aucune inscription, aucun service en ligne, aucune collecte de données.",\n        "Note names" => "Nom des notes",\n        "OK" => "OK",\n        "OPTIONS" => "OPTIONS",\n        "Off" => "Désactivé",\n        "On" => "Activé",\n        "Open detached plugins with the main window" => "Ouvrir les plugins détachés avec la fenêtre principale",\n        "Open in project browser" => "Ouvrir dans l’explorateur de projet",\n        "Open new plugin windows floating" => "Ouvrir les nouvelles fenêtres de plugins en mode flottant",\n        "Open..." => "Ouvrir…",\n        "Optimize for" => "Optimiser pour",\n        "Output" => "Sortie",\n        "Output device" => "Périphérique de sortie",\n        "Output devices" => "Périphériques de sortie",\n        "PATTERNS" => "MOTIFS",\n        "Pan" => "Panoramique",\n        "Panning" => "Panoramique",\n        "Paste" => "Coller",\n        "Pattern" => "Motif",\n        "Pattern options" => "Options du motif",\n        "Patterns" => "Motifs",\n        "Pause" => "Pause",\n        "Piano roll" => "Piano roll",\n        "Pitch" => "Hauteur",\n        "Play" => "Lecture",\n        "Playlist" => "Playlist",\n        "Plugin library" => "Bibliothèque de plugins",\n        "Plugin manager" => "Gestionnaire de plugins",\n        "Plugin performance monitor" => "Moniteur de performances des plugins",\n        "Plugins" => "Plugins",\n        "Pop-ups scaling" => "Échelle des fenêtres contextuelles",\n        "Project" => "Projet",\n        "Project author" => "Auteur du projet",\n        "Project comments" => "Commentaires du projet",\n        "Project data size warning" => "Alerte sur la taille des données du projet",\n        "Project general settings" => "Paramètres généraux du projet",\n        "Project genre" => "Genre du projet",\n        "Project info" => "Informations du projet",\n        "Project title" => "Titre du projet",\n        "Project web link" => "Lien web du projet",\n        "Random color" => "Couleur aléatoire",\n        "Record" => "Enregistrer",\n        "Recording" => "Enregistrement",\n        "Recording filter" => "Filtre d’enregistrement",\n        "Recording options" => "Options d’enregistrement",\n        "Redo" => "Rétablir",\n        "Refresh device list" => "Actualiser la liste des périphériques",\n        "Remove" => "Retirer",\n        "Rename" => "Renommer",\n        "Rename and colour..." => "Renommer et colorer…",\n        "Render and replace..." => "Rendre et remplacer…",\n        "Render as audio clip..." => "Rendre sous forme de clip audio…",\n        "Render to audio clip" => "Rendre en clip audio",\n        "Rescan all" => "Tout réanalyser",\n        "Rescan plugins with errors" => "Réexaminer les plugins en erreur",\n        "Reset" => "Réinitialiser",\n        "Reset time spent on project" => "Réinitialiser le temps passé sur le projet",\n        "Restore backup..." => "Restaurer une sauvegarde…",\n        "Restore previous state after solo" => "Restaurer l’état précédent après un solo",\n        "Right button clears steps" => "Le clic droit efface les pas",\n        "Sample rate (Hz)" => "Fréquence d’échantillonnage (Hz)",\n        "Save" => "Enregistrer",\n        "Save as template..." => "Enregistrer comme modèle…",\n        "Save as..." => "Enregistrer sous…",\n        "Save new version" => "Enregistrer une nouvelle version",\n        "Save preset..." => "Enregistrer un preset…",\n        "Save to new project folder..." => "Enregistrer dans un nouveau dossier de projet…",\n        "Scan for new plugins" => "Rechercher de nouveaux plugins",\n        "Scan for new plugins at startup" => "Rechercher de nouveaux plugins au démarrage",\n        "Search" => "Rechercher",\n        "Select" => "Sélectionner",\n        "Select all" => "Tout sélectionner",\n        "Select in arranger" => "Sélectionner dans l’arrangeur",\n        "Select linked controls automatically" => "Sélectionner automatiquement les contrôles liés",\n        "Set time signature..." => "Définir la signature rythmique…",\n        "Settings" => "Paramètres",\n        "Shared" => "Partagé",\n        "Show ASIO panel" => "Afficher le panneau ASIO",\n        "Show help in a web browser" => "Afficher l’aide dans le navigateur",\n        "Show info on opening" => "Afficher les informations à l’ouverture",\n        "Show recent changes at the top" => "Afficher les modifications récentes en haut",\n        "Show startup splash screen" => "Afficher l’écran d’accueil",\n        "Show undo history in the browser when undoing changes" => "Afficher l’historique des annulations dans l’explorateur",\n        "Silent startup" => "Démarrage silencieux",\n        "Small scrollbars in editors" => "Petites barres de défilement dans les éditeurs",\n        "Smoothing" => "Lissage",\n        "Split by instrument" => "Séparer par instrument",\n        "Start on input" => "Démarrer à l’entrée",\n        "Startup project" => "Projet de démarrage",\n        "Step edit" => "Édition pas à pas",\n        "Stereo" => "Stéréo",\n        "Stop" => "Arrêter",\n        "Support" => "Assistance",\n        "Swap mouse buttons for drawing" => "Inverser les boutons de dessin",\n        "System" => "Système",\n        "TOOLS" => "OUTILS",\n        "Tap tempo" => "Taper le tempo",\n        "Theme" => "Thème",\n        "Theme settings" => "Paramètres du thème",\n        "Thick lines" => "Lignes épaisses",\n        "Toolbars" => "Barres d’outils",\n        "Toolbars scaling" => "Échelle des barres d’outils",\n        "Tools" => "Outils",\n        "Touch controller" => "Contrôleur tactile",\n        "Transparent menus" => "Menus transparents",\n        "Transparent windows" => "Fenêtres transparentes",\n        "Transport" => "Transport",\n        "Transpose..." => "Transposer…",\n        "Tutorials" => "Tutoriels",\n        "Undo" => "Annuler",\n        "Undo history" => "Historique des annulations",\n        "Undo knob tweaks" => "Annuler les changements des potentiomètres",\n        "Update languages" => "Mettre à jour les langues",\n        "Updates" => "Mises à jour",\n        "VIEW" => "AFFICHAGE",\n        "Vertical scrolling speed" => "Vitesse de défilement vertical",\n        "View" => "Affichage",\n        "Volume" => "Volume",\n        "What\'s new" => "Nouveautés",\n        "Windows" => "Fenêtres",\n        _ => return Cow::Borrowed(input),\n    };\n    Cow::Borrowed(value)\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn languages_switch() {\n        set_french(true);\n        assert_eq!(translate("Save"), "Enregistrer");\n        set_french(false);\n        assert_eq!(translate("Save"), "Save");\n        set_french(true);\n    }\n}\n'
+          
+          
+          def main():
+              (ROOT / 'crates/os-ui/src/locale.rs').write_text(LOCALE_RS, encoding='utf-8')
+              replace_once('crates/os-ui/src/lib.rs', 'mod glyph;\n', 'mod glyph;\npub mod locale;\n')
+              replace_once('crates/os-ui/src/lib.rs',
+                  '    pub fn text_width(&mut self, f: Font, s: &str) -> f32 {\n',
+                  '    pub fn text_width(&mut self, f: Font, s: &str) -> f32 {\n        let localized = locale::translate(s);\n        let s = localized.as_ref();\n')
+              replace_once('crates/os-ui/src/lib.rs',
+                  '    pub fn text(&mut self, f: Font, x: f32, y: f32, c: Color, s: &str) -> f32 {\n',
+                  '    pub fn text(&mut self, f: Font, x: f32, y: f32, c: Color, s: &str) -> f32 {\n        let localized = locale::translate(s);\n        let s = localized.as_ref();\n')
+              replace_once('crates/os-ui/src/lib.rs',
+                  '    pub fn text_vertical(&mut self, f: Font, x: f32, y_bottom: f32, c: Color, s: &str) -> f32 {\n',
+                  '    pub fn text_vertical(&mut self, f: Font, x: f32, y_bottom: f32, c: Color, s: &str) -> f32 {\n        let localized = locale::translate(s);\n        let s = localized.as_ref();\n')
+              replace_once('crates/os-app/src/prefs.rs',
+                  '/// General ▸ Language: how note names read',
+                  'pub const UI_LANGUAGE: Combo = Combo { key: "ui_language", label: "Language", choices: &["English (US) (en)", "Français (FR) (fr)"], default: 1 };\n\n/// General ▸ Language: how note names read')
+              replace_once('crates/os-app/src/prefs.rs',
+                  'pub const COMBOS: &[&Combo] = &[&MAIN_GUI_SCALING, &POPUPS_SCALING,',
+                  'pub const COMBOS: &[&Combo] = &[&MAIN_GUI_SCALING, &POPUPS_SCALING, &UI_LANGUAGE,')
+              replace_once('crates/os-app/src/prefs.rs',
+                  'pub fn set_choice(c: &Combo, i: usize) {\n    if let Some(v) = c.choices.get(i) {\n        write(c.key, v);',
+                  'pub fn set_choice(c: &Combo, i: usize) {\n    if let Some(v) = c.choices.get(i) {\n        write(c.key, v);\n        if c.key == UI_LANGUAGE.key { os_ui::locale::set_french(i == 1); }')
+              replace_once('crates/os-app/src/prefs.rs',
+                  '        assert_eq!((find_check("Main GUI scaling"), find_combo("Language"), find_check("")), (None, None, None));',
+                  '        assert_eq!((find_check("Main GUI scaling"), find_check("")), (None, None));\n        assert_eq!(find_combo("Language"), Some(&UI_LANGUAGE));')
+              replace_once('crates/os-app/src/views/settings.rs',
+                  '                combo("English (US) (en)", 176.0, "Language"),',
+                  '                combo(p::choice(&p::UI_LANGUAGE), 176.0, p::UI_LANGUAGE.label),')
+              replace_once('crates/os-app/src/main.rs',
+                  '    app::move_old_settings();\n',
+                  '    app::move_old_settings();\n    os_ui::locale::set_french(prefs::index(&prefs::UI_LANGUAGE) == 1);\n')
+              print('Lemon Studio: language switch and translation dictionary patched successfully.')
+          
+          
+          if __name__ == '__main__':
+              main()
+          '@ | Set-Content -LiteralPath patch_lemon_fr.py -Encoding utf8
+          python patch_lemon_fr.py
+      - name: Configurer libclang
+        shell: pwsh
+        run: |
+          $clang = 'C:\Program Files\LLVM\bin\libclang.dll'
+          if (-not (Test-Path $clang)) { choco install llvm -y --no-progress }
+          if (-not (Test-Path $clang)) { throw 'LLVM libclang.dll introuvable' }
+          'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> $env:GITHUB_ENV
+      - name: Compiler Lemon Studio FR (release)
+        run: cargo build -p os-app --release --locked
+      - name: Emballer la version FR
+        shell: pwsh
+        run: |
+          $out='Lemon-Studio-Windows-x64-FR'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item 'target\release\lemonstudio.exe' "$out\lemonstudio.exe"
+          Copy-Item 'LICENSE' "$out\LICENSE.txt"
+          Copy-Item 'THIRD-PARTY-NOTICES.txt' "$out\THIRD-PARTY-NOTICES.txt"
+          'Version francaise experimentale: ouvrir Options > General settings > Language et choisir Francais (FR). Traduction partielle. Logiciel pre-alpha. Testez uniquement des copies de fichiers FLP.' | Set-Content -Path "$out\LISEZ-MOI.txt" -Encoding utf8
+      - name: Publier le ZIP Windows FR
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lemon-Studio-Windows-x64-FR
+          path: Lemon-Studio-Windows-x64-FR/
+          if-no-files-found: error
+          retention-days: 14
