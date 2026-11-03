@@ -1,0 +1,578 @@
+name: Lemon Studio FR + Assistant IA - Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lemon-ai.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  assistant-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
+
+      - name: Recuperer la derniere version FR validee
+        uses: actions/download-artifact@v4
+        with:
+          name: Lemon-Studio-Windows-x64-FR
+          run-id: 41723186509
+          github-token: ${{ github.token }}
+          repository: dedmauhaze/Lemon-Studio
+          path: Lemon-Studio-FR-AI
+
+      - name: Installer Python pour la compilation cloud
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generer et verifier le source de l'assistant
+        shell: pwsh
+        run: |
+          @'
+          # -*- coding: utf-8 -*-
+          """Lemon Studio FR — Assistant IA (preview companion).
+
+          Standalone Windows UI bundled using PyInstaller. Launches a local Lemon Studio
+          process with an authenticated, proposal-only Control Plane. No API key is stored.
+          Uses only Python's standard library (including Tkinter).
+          """
+          from __future__ import annotations
+
+          import json
+          import os
+          import queue
+          import re
+          import secrets
+          import socket
+          import subprocess
+          import sys
+          import threading
+          import time
+          import unicodedata
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Text, ttk, messagebox
+          from tkinter.scrolledtext import ScrolledText
+
+          APP_TITLE = "Lemon Studio — Assistant IA (préversion)"
+          OPTIONS = ("Sans IA (commandes locales)", "ChatGPT (API OpenAI)", "Claude (API Anthropic)", "Ollama (sur ce PC)")
+          DEFAULT_MODELS = {
+              OPTIONS[0]: "",
+              OPTIONS[1]: "gpt-5-mini",
+              OPTIONS[2]: "claude-sonnet-4-6",
+              OPTIONS[3]: "llama3.2",
+          }
+          SYSTEM_PROMPT = """Tu es l'assistant d'un logiciel de musique nommé Lemon Studio.
+          Réponds en français uniquement et produis EXACTEMENT un objet JSON, sans markdown :
+          {"message": "Explication honnête et courte de ce que tu proposes", "commands": [{"op":"set_tempo","bpm":200}]}
+          Tu peux proposer au plus 8 commandes. Opérations AUTORISÉES uniquement :
+          set_tempo {bpm: nombre de 10 à 522}
+          set_swing {swing: nombre de 0 à 1}
+          set_time_signature {numerator: entier de 1 à 32, denominator: 2 ou 4 ou 8 ou 16}
+          add_channel {name: nom du canal, facultatif} (canal Sampler muet sans échantillon)
+          add_pattern {name: nom du pattern, facultatif}
+          add_track {} (nouvelle piste de mixeur)
+          set_info {title: titre du projet}
+          add_notes {pattern: ID EXISTANT, notes: [{channel: ID EXISTANT,position: ticks >= 0,length: ticks > 0,key: 0..127,velocity: 1..128,pan: 0..128}]}.
+          Utilise exclusivement des ID présents dans l'état du projet fourni. Ne fabrique jamais d'ID.
+          N'utilise JAMAIS de commandes dangereuses, suppression, sauvegarde, ajout d'effets, accès disque ni outil réseau.
+          Si un instrument ou pattern doit être créé avant de recevoir des notes, propose d'abord de l'ajouter, puis demande une seconde requête pour ajouter les notes après validation par l'utilisateur.
+          N'affirme pas générer de son ni choisir un sample quand tu n'as créé que des pistes/patterns vides.
+          Si la demande est impossible avec les opérations autorisées, réponds avec commands = [] et explique clairement la limite.
+          L'utilisateur devra confirmer toute proposition dans Lemon Studio; tu ne peux jamais l'appliquer directement.
+          """
+
+
+          def clean(text: str) -> str:
+              return "".join(c for c in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(c))
+
+
+          def offline_plan(text: str) -> dict:
+              """Small deterministic command subset, no AI or Internet required."""
+              t = clean(text)
+              commands: list[dict] = []
+              bpm = re.search(r"\b(\d{2,3})\s*bpm\b", t)
+              if not bpm:
+                  bpm = re.search(r"\b(?:tempo|bpm)\s*(?:a|de|sur|=|:)?\s*(\d{2,3})\b", t)
+              if bpm:
+                  value = int(bpm.group(1))
+                  if not 10 <= value <= 522:
+                      raise ValueError("Le tempo doit être compris entre 10 et 522 BPM.")
+                  commands.append({"op": "set_tempo", "bpm": value})
+
+              if re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?(?:piste\s+(?:de\s+)?mixeur|piste\s+mixer|insert\s+mixeur)\b", t):
+                  commands.append({"op": "add_track"})
+
+              pattern_match = re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?(?:pattern|motif)\s*(?:nomme|appele|:)?\s*([\w -]{0,42})", t)
+              if pattern_match:
+                  name = pattern_match.group(1).strip(" .,-")
+                  commands.append({"op": "add_pattern", **({"name": name.title()} if name else {})})
+
+              chan = re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?(?:canal|channel|instrument)\s*(?:nomme|appele|:)?\s*([\w -]{0,42})", t)
+              if chan:
+                  name = chan.group(1).strip(" .,-")
+                  commands.append({"op": "add_channel", **({"name": name.title()} if name else {})})
+              elif re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?kick\b", t):
+                  commands.append({"op": "add_channel", "name": "Kick"})
+
+              title = re.search(r"\b(?:nomme|renomme|appelle)\s+(?:le\s+)?projet\s+(.{1,64})", text, re.IGNORECASE)
+              if title:
+                  commands.append({"op": "set_info", "title": title.group(1).strip(" \"'.,")})
+
+              if not commands:
+                  return {"message": "Mode local : je comprends actuellement le BPM, l'ajout de canaux, de pistes du mixeur, de patterns et le nom du projet. Pour créer des notes ou des arrangements à partir d'une description libre, choisis ChatGPT, Claude ou Ollama.", "commands": []}
+              return {"message": "Voici les modifications que je peux proposer sans connexion IA. Un nouveau canal Sampler ne produit pas de son tant que tu ne charges pas de sample.", "commands": commands[:8]}
+
+
+          def parse_json_answer(raw: str) -> dict:
+              if not isinstance(raw, str):
+                  raise ValueError("L'IA n'a pas retourné de texte.")
+              stripped = raw.strip()
+              start = stripped.find("{")
+              if start < 0:
+                  raise ValueError("La réponse de l'IA ne contient pas de JSON exploitable.")
+              try:
+                  obj, _ = json.JSONDecoder().raw_decode(stripped[start:])
+              except json.JSONDecodeError as e:
+                  raise ValueError("La réponse de l'IA n'est pas un JSON valide.") from e
+              if not isinstance(obj, dict):
+                  raise ValueError("Réponse IA incorrecte : objet attendu.")
+              return obj
+
+
+          def _short_str(x, limit=80):
+              if not isinstance(x, str) or not x.strip() or len(x) > limit or "\x00" in x or "\n" in x:
+                  raise ValueError("Nom ou valeur de texte invalide.")
+              return x.strip()
+
+
+          def _int(x, mini, maxi):
+              if type(x) is not int or not mini <= x <= maxi:
+                  raise ValueError(f"Entier requis entre {mini} et {maxi}.")
+              return x
+
+
+          def _float(x, mini, maxi):
+              if isinstance(x, bool) or not isinstance(x, (int, float)) or not mini <= float(x) <= maxi:
+                  raise ValueError(f"Nombre requis entre {mini} et {maxi}.")
+              return float(x)
+
+
+          def validate_commands(plan: dict, state: dict) -> tuple[str, list[dict]]:
+              """Hard allowlist. Never pass arbitrary model-generated operations to Lemon Studio."""
+              msg = str(plan.get("message", "Proposition de modifications."))[:1200]
+              items = plan.get("commands", [])
+              if not isinstance(items, list) or len(items) > 8:
+                  raise ValueError("L'assistant doit proposer au maximum huit commandes.")
+              channel_ids = {int(c["id"]) for c in state.get("channels", []) if isinstance(c, dict) and type(c.get("id")) is int}
+              pattern_ids = {int(p["id"]) for p in state.get("patterns", []) if isinstance(p, dict) and type(p.get("id")) is int}
+              ppq = int(state.get("ppq") or 96)
+              result = []
+              for item in items:
+                  if not isinstance(item, dict):
+                      raise ValueError("Commande non valide.")
+                  op = item.get("op")
+                  if op == "set_tempo" and set(item) == {"op", "bpm"}:
+                      result.append({"op": op, "bpm": _float(item["bpm"], 10, 522)})
+                  elif op == "set_swing" and set(item) == {"op", "swing"}:
+                      result.append({"op": op, "swing": _float(item["swing"], 0, 1)})
+                  elif op == "set_time_signature" and set(item) == {"op", "numerator", "denominator"}:
+                      num = _int(item["numerator"], 1, 32)
+                      den = _int(item["denominator"], 2, 16)
+                      if den not in (2, 4, 8, 16):
+                          raise ValueError("Dénominateur invalide.")
+                      result.append({"op": op, "numerator": num, "denominator": den})
+                  elif op in ("add_channel", "add_pattern") and set(item) <= {"op", "name"}:
+                      result.append({"op": op, **({"name": _short_str(item["name"], 64)} if "name" in item else {})})
+                  elif op == "add_track" and set(item) == {"op"}:
+                      result.append({"op": op})
+                  elif op == "set_info" and set(item) == {"op", "title"}:
+                      result.append({"op": op, "title": _short_str(item["title"], 110)})
+                  elif op == "add_notes" and set(item) == {"op", "pattern", "notes"}:
+                      pid = _int(item["pattern"], 1, 2**32 - 1)
+                      if pid not in pattern_ids:
+                          raise ValueError("Le pattern indiqué par l'IA n'existe pas encore.")
+                      notes = item["notes"]
+                      if not isinstance(notes, list) or not 1 <= len(notes) <= 64:
+                          raise ValueError("Ajoute entre 1 et 64 notes par commande.")
+                      clean_notes = []
+                      for note in notes:
+                          if not isinstance(note, dict) or set(note) - {"channel", "position", "length", "key", "velocity", "pan"}:
+                              raise ValueError("Champs de note invalides.")
+                          if not {"channel", "position", "length", "key"} <= set(note):
+                              raise ValueError("La note doit indiquer channel, position, length et key.")
+                          cid = _int(note["channel"], 1, 2**32 - 1)
+                          if cid not in channel_ids:
+                              raise ValueError("Le canal indiqué par l'IA n'existe pas encore.")
+                          n = {"channel": cid, "position": _int(note["position"], 0, ppq * 256),
+                               "length": _int(note["length"], 1, ppq * 16), "key": _int(note["key"], 0, 127),
+                               "velocity": _int(note.get("velocity", 100), 1, 128), "pan": _int(note.get("pan", 64), 0, 128)}
+                          clean_notes.append(n)
+                      result.append({"op": op, "pattern": pid, "notes": clean_notes})
+                  else:
+                      raise ValueError(f"Commande non autorisée ou paramètres invalides : {op!r}.")
+              return msg, result
+
+
+          def project_summary(state: dict) -> dict:
+              return {"tempo": state.get("tempo"), "ppq": state.get("ppq"),
+                      "channels": [{"id": c.get("id"), "name": c.get("name"), "kind": c.get("kind")} for c in state.get("channels", [])[:20]],
+                      "patterns": [{"id": p.get("id"), "name": p.get("name"), "notes": p.get("notes")} for p in state.get("patterns", [])[:20]],
+                      "mixer": [{"id": m.get("id"), "name": m.get("name")} for m in state.get("mixer", [])[:15]]}
+
+
+          def api_post(url: str, headers: dict, payload: dict) -> dict:
+              req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                           headers={"Content-Type": "application/json", **headers}, method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=55) as response:
+                      return json.loads(response.read(2_000_000).decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  msg = e.read(2048).decode("utf-8", "replace")
+                  raise RuntimeError(f"Erreur API HTTP {e.code} : {msg[:500]}") from None
+              except urllib.error.URLError as e:
+                  raise RuntimeError(f"Connexion au fournisseur IA impossible : {e.reason}") from None
+
+
+          def online_plan(text: str, state: dict, provider: str, model: str, api_key: str) -> dict:
+              payload = json.dumps({"demande": text[:1500], "etat_du_projet": project_summary(state)}, ensure_ascii=False)
+              model = _short_str(model, 120)
+              if provider == OPTIONS[1]:
+                  if not api_key.strip():
+                      raise ValueError("Saisis ta clé API OpenAI (ton abonnement ChatGPT ne suffit pas).")
+                  response = api_post("https://api.openai.com/v1/responses", {"Authorization": "Bearer " + api_key.strip()},
+                                      {"model": model, "instructions": SYSTEM_PROMPT, "input": payload, "max_output_tokens": 1500})
+                  output_text = response.get("output_text", "")
+                  if not output_text:
+                      output_text = "\n".join(content.get("text", "") for out in response.get("output", [])
+                                              for content in out.get("content", []) if content.get("type") == "output_text")
+                  return parse_json_answer(output_text)
+              if provider == OPTIONS[2]:
+                  if not api_key.strip():
+                      raise ValueError("Saisis ta clé API Anthropic (ton abonnement Claude ne suffit pas).")
+                  response = api_post("https://api.anthropic.com/v1/messages",
+                                      {"x-api-key": api_key.strip(), "anthropic-version": "2023-06-01"},
+                                      {"model": model, "max_tokens": 1500, "system": SYSTEM_PROMPT,
+                                       "messages": [{"role": "user", "content": payload}]})
+                  output_text = "\n".join(c.get("text", "") for c in response.get("content", []) if c.get("type") == "text")
+                  return parse_json_answer(output_text)
+              if provider == OPTIONS[3]:
+                  response = api_post("http://127.0.0.1:11434/api/generate", {},
+                                      {"model": model, "prompt": SYSTEM_PROMPT + "\n" + payload, "stream": False})
+                  return parse_json_answer(response.get("response", ""))
+              return offline_plan(text)
+
+
+          class LemonRpc:
+              def __init__(self, port: int, token: str):
+                  self.port = port
+                  self.token = token
+
+              def call(self, method: str, **params):
+                  # Per-request connections are intentional: no shared socket across Tk workers.
+                  with socket.create_connection(("127.0.0.1", self.port), timeout=6) as conn:
+                      conn.settimeout(12)
+                      f = conn.makefile("r", encoding="utf-8")
+                      def send(name, data):
+                          data = json.dumps({"jsonrpc": "2.0", "id": 1 if name == "hello" else 2,
+                                             "method": name, "params": data}, ensure_ascii=False) + "\n"
+                          conn.sendall(data.encode("utf-8"))
+                          line = f.readline()
+                          if not line:
+                              raise ConnectionError("Lemon Studio a fermé la connexion.")
+                          out = json.loads(line)
+                          if "error" in out:
+                              raise RuntimeError("Lemon Studio : " + out["error"].get("message", "Erreur inconnue"))
+                          return out.get("result")
+                      send("hello", {"name": "Assistant IA FR", "token": self.token})
+                      return send(method, params)
+
+
+          def local_port() -> int:
+              with socket.socket() as s:
+                  s.bind(("127.0.0.1", 0))
+                  return s.getsockname()[1]
+
+
+          class AssistantApp:
+              def __init__(self):
+                  self.root = Tk()
+                  self.root.title(APP_TITLE)
+                  self.root.geometry("670x750")
+                  self.root.minsize(535, 600)
+                  self.root.configure(bg="#111721")
+                  self.events = queue.Queue()
+                  self.pending = False
+                  self.proc = None
+                  self.rpc = None
+                  self.mode = StringVar(value=OPTIONS[0])
+                  self.model = StringVar(value="")
+                  self.api_key = StringVar(value="")
+                  self.allow_online = BooleanVar(value=False)
+                  self.status = StringVar(value="Démarrage de Lemon Studio...")
+                  self._paint()
+                  self.root.after(100, self._drain)
+                  self.root.protocol("WM_DELETE_WINDOW", self._close)
+                  threading.Thread(target=self._launch, daemon=True).start()
+
+              def _paint(self):
+                  bg, panel, ink, muted, accent = "#111721", "#1b2533", "#edf1f7", "#a4afbf", "#f2bd55"
+                  style = ttk.Style(self.root)
+                  style.theme_use("clam")
+                  style.configure("AI.TCombobox", fieldbackground=panel, background=panel, foreground="#111721", padding=6)
+                  head = ttk.Frame(self.root)
+                  head.pack(fill=X, padx=18, pady=(20, 7))
+                  head.configure(style="AI.Head.TFrame")
+                  style.configure("AI.Head.TFrame", background=bg)
+                  ttk.Label(head, text="🍋  LEMON STUDIO  ·  ASSISTANT IA", foreground=accent,
+                            background=bg, font=("Segoe UI", 16, "bold")).pack(anchor="w")
+                  ttk.Label(head, text="Fenêtre de contrôle séparée · changements confirmés dans Lemon Studio",
+                            foreground=muted, background=bg, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
+
+                  settings = ttk.Frame(self.root, style="AI.Head.TFrame")
+                  settings.pack(fill=X, padx=18, pady=(8, 8))
+                  ttk.Label(settings, text="Fournisseur IA", foreground=ink, background=bg).grid(row=0, column=0, sticky="w")
+                  self.combo = ttk.Combobox(settings, state="readonly", values=OPTIONS, textvariable=self.mode, width=28)
+                  self.combo.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(3, 7))
+                  self.combo.bind("<<ComboboxSelected>>", self._mode_changed)
+                  ttk.Label(settings, text="Modèle", foreground=ink, background=bg).grid(row=0, column=1, sticky="w")
+                  self.model_entry = ttk.Entry(settings, textvariable=self.model, width=23)
+                  self.model_entry.grid(row=1, column=1, sticky="ew", pady=(3, 7))
+                  settings.columnconfigure(0, weight=1)
+                  settings.columnconfigure(1, weight=1)
+                  ttk.Label(settings, text="Clé API (non enregistrée, inutile en mode local / Ollama)",
+                            foreground=muted, background=bg).grid(row=2, column=0, columnspan=2, sticky="w")
+                  self.key_entry = ttk.Entry(settings, textvariable=self.api_key, show="●")
+                  self.key_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 2))
+                  self.privacy = ttk.Checkbutton(settings,
+                      text="J'autorise l'envoi d'un résumé de mon projet à l'API IA choisie",
+                      variable=self.allow_online)
+                  self.privacy.grid(row=4, column=0, columnspan=2, sticky="w", pady=(5, 3))
+                  ttk.Label(settings, text="Les API en ligne sont payantes séparément. Aucune clé n'est sauvegardée.",
+                            foreground=muted, background=bg).grid(row=5, column=0, columnspan=2, sticky="w")
+                  self._mode_changed()
+
+                  self.chat = ScrolledText(self.root, height=16, wrap="word", bg="#141c28", fg=ink,
+                                           insertbackground=ink, relief="flat", padx=13, pady=12, font=("Segoe UI", 10), state="disabled")
+                  self.chat.pack(fill=BOTH, expand=True, padx=18, pady=(7, 12))
+                  self.chat.tag_configure("user", foreground="#f2bd55", spacing1=5, spacing3=5)
+                  self.chat.tag_configure("assistant", foreground=ink, spacing1=5, spacing3=9)
+                  self.chat.tag_configure("system", foreground="#b2c8e2", spacing1=5, spacing3=10)
+                  self._chat("system", "Exemples : « Mets le tempo à 200 BPM », « Ajoute un canal Kick », « Crée un pattern Intro ».\nPour générer des notes dans un pattern existant, choisis une IA en ligne ou Ollama.\n")
+
+                  ttk.Label(self.root, text="Ton instruction", background=bg, foreground=ink,
+                            font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=18)
+                  self.prompt = Text(self.root, height=3, bg=panel, fg=ink, insertbackground=ink,
+                                     relief="flat", padx=10, pady=8, wrap="word", font=("Segoe UI", 10))
+                  self.prompt.pack(fill=X, padx=18, pady=(5, 10))
+                  self.prompt.bind("<Control-Return>", lambda _: self._submit())
+                  bottom = ttk.Frame(self.root, style="AI.Head.TFrame")
+                  bottom.pack(fill=X, padx=18, pady=(0, 5))
+                  self.submit = ttk.Button(bottom, text="Proposer au projet (Ctrl+Entrée)", command=self._submit)
+                  self.submit.pack(side=LEFT)
+                  ttk.Button(bottom, text="Actualiser l'état", command=self._refresh_state).pack(side=RIGHT)
+                  ttk.Label(self.root, textvariable=self.status, background=bg, foreground=muted,
+                            font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(4, 13))
+
+              def _mode_changed(self, _event=None):
+                  provider = self.mode.get()
+                  if _event is not None:
+                      self.api_key.set("")
+                      self.allow_online.set(False)
+                  self.model.set(DEFAULT_MODELS.get(provider, ""))
+                  self.model_entry.configure(state="normal" if provider != OPTIONS[0] else "disabled")
+                  self.key_entry.configure(state="normal" if provider in OPTIONS[1:3] else "disabled")
+                  self.privacy.configure(state="normal" if provider in OPTIONS[1:3] else "disabled")
+
+              def _chat(self, tag, msg):
+                  self.chat.configure(state="normal")
+                  self.chat.insert(END, ("Vous : " if tag == "user" else "Assistant : " if tag == "assistant" else "ℹ ") + msg + "\n", tag)
+                  self.chat.configure(state="disabled")
+                  self.chat.see(END)
+
+              def _notify(self, kind, payload):
+                  self.events.put((kind, payload))
+
+              def _drain(self):
+                  try:
+                      while True:
+                          kind, payload = self.events.get_nowait()
+                          if kind == "status":
+                              self.status.set(payload)
+                          elif kind == "chat":
+                              self._chat("assistant", payload)
+                          elif kind == "connected":
+                              self.rpc = payload
+                              self.status.set("Connecté à Lemon Studio · validation obligatoire des modifications")
+                              self._chat("system", "Lemon Studio est connecté. Les propositions devront être acceptées dans sa fenêtre.")
+                          elif kind == "ready":
+                              self.pending = False
+                              self.submit.configure(state="normal")
+                  except queue.Empty:
+                      pass
+                  self.root.after(100, self._drain)
+
+              def _launch(self):
+                  try:
+                      if getattr(sys, "frozen", False):
+                          root = Path(sys.executable).resolve().parent
+                      else:
+                          root = Path(__file__).resolve().parent
+                      exe = root / "lemonstudio.exe"
+                      if not exe.is_file():
+                          raise FileNotFoundError(f"Impossible de trouver lemonstudio.exe dans {root}. Décompresse intégralement l'archive ZIP.")
+                      port, token = local_port(), secrets.token_urlsafe(32)
+                      self.proc = subprocess.Popen([str(exe), "--control", str(port), "--control-level", "propose",
+                                                    "--control-token", token], cwd=str(root))
+                      rpc = LemonRpc(port, token)
+                      for _ in range(180):
+                          if self.proc.poll() is not None:
+                              raise RuntimeError("Lemon Studio s'est fermé pendant le démarrage.")
+                          try:
+                              rpc.call("state")
+                              self._notify("connected", rpc)
+                              return
+                          except (OSError, TimeoutError, ConnectionError):
+                              time.sleep(0.25)
+                      raise RuntimeError("Lemon Studio n'a pas ouvert son interface de contrôle. Réessaie en fermant les anciennes fenêtres.")
+                  except Exception as exc:
+                      self._notify("status", "Échec de connexion")
+                      self._notify("chat", str(exc))
+
+              def _busy_start(self):
+                  if self.pending:
+                      return False
+                  if not self.rpc:
+                      self._chat("system", "Lemon Studio n'est pas encore connecté.")
+                      return False
+                  self.pending = True
+                  self.submit.configure(state="disabled")
+                  return True
+
+              def _submit(self):
+                  value = self.prompt.get("1.0", END).strip()
+                  if not value or not self._busy_start():
+                      return
+                  provider, model, key = self.mode.get(), self.model.get(), self.api_key.get()
+                  if provider in OPTIONS[1:3] and not self.allow_online.get():
+                      self.pending = False
+                      self.submit.configure(state="normal")
+                      self._chat("system", "Coche la case de consentement avant d'envoyer le résumé du projet à une API externe.")
+                      return
+                  self.prompt.delete("1.0", END)
+                  self._chat("user", value)
+                  self.status.set("Analyse de la demande...")
+                  def work():
+                      try:
+                          state = self.rpc.call("state")
+                          p = offline_plan(value) if provider == OPTIONS[0] else online_plan(value, state, provider, model, key)
+                          msg, cmds = validate_commands(p, state)
+                          self._notify("chat", msg)
+                          if cmds:
+                              self._notify("chat", "Proposition :\n" + "\n".join(" • " + json.dumps(c, ensure_ascii=False)[:350] for c in cmds))
+                              result = self.rpc.call("propose", commands=cmds, name="Assistant IA : " + value[:48])
+                              self._notify("chat", f"Proposition n° {result.get('proposal')} transmise. Confirme ou refuse les changements dans Lemon Studio.")
+                          else:
+                              self._notify("chat", "Aucune modification proposée.")
+                          self._notify("status", "Prêt · aucun changement sans confirmation")
+                      except Exception as exc:
+                          self._notify("chat", "Impossible de proposer ces changements : " + str(exc))
+                          self._notify("status", "Erreur · tu peux réessayer")
+                      finally:
+                          self._notify("ready", None)
+                  threading.Thread(target=work, daemon=True).start()
+
+              def _refresh_state(self):
+                  if not self._busy_start():
+                      return
+                  def work():
+                      try:
+                          s = self.rpc.call("state")
+                          self._notify("chat", f"Projet actuel : {s.get('tempo')} BPM · {len(s.get('channels',[]))} canaux · {len(s.get('patterns',[]))} patterns.")
+                      except Exception as exc:
+                          self._notify("chat", "Impossible de lire le projet : " + str(exc))
+                      finally:
+                          self._notify("ready", None)
+                  threading.Thread(target=work, daemon=True).start()
+
+              def _close(self):
+                  # We deliberately do not terminate Lemon Studio: closing the AI shouldn't lose DAW work.
+                  self.root.destroy()
+
+              def run(self):
+                  self.root.mainloop()
+
+
+          def run_self_tests():
+              sample = {"ppq": 96, "channels": [{"id": 7, "name": "Sampler"}], "patterns": [{"id": 21, "name": "Intro"}]}
+              assert offline_plan("Mets le tempo à 200 BPM")["commands"] == [{"op": "set_tempo", "bpm": 200}]
+              assert offline_plan("ajoute un canal Kick")["commands"][0]["op"] == "add_channel"
+              assert offline_plan("crée un pattern Intro")["commands"][0]["op"] == "add_pattern"
+              assert validate_commands({"commands": [{"op": "add_notes", "pattern": 21, "notes": [{"channel": 7, "position": 0, "length": 96, "key": 60}]}]}, sample)[1][0]["notes"][0]["velocity"] == 100
+              for malicious in [{"op": "delete_channel", "channel": 7}, {"op": "add_notes", "pattern": 22, "notes": [{"channel": 7, "position": 0, "length": 96, "key": 60}]}]:
+                  try:
+                      validate_commands({"commands": [malicious]}, sample)
+                      raise AssertionError("Unsafe command accepted")
+                  except ValueError:
+                      pass
+              assert parse_json_answer('```json\n{"message":"ok","commands":[]}\n```')["message"] == "ok"
+              print("Lemon Studio AI: self-tests OK")
+
+
+          if __name__ == "__main__":
+              if "--self-test" in sys.argv:
+                  run_self_tests()
+              else:
+                  AssistantApp().run()
+          '@ | Set-Content -LiteralPath lemon_ai.py -Encoding utf8
+          python lemon_ai.py --self-test
+
+      - name: Compiler le lanceur IA Windows autonome
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name Lemon-Studio-Assistant-IA lemon_ai.py
+          if (-not (Test-Path 'dist\Lemon-Studio-Assistant-IA.exe')) { throw 'Assistant IA introuvable' }
+          if (-not (Test-Path 'Lemon-Studio-FR-AI\lemonstudio.exe')) { throw 'Lemon Studio FR introuvable' }
+          Copy-Item 'dist\Lemon-Studio-Assistant-IA.exe' 'Lemon-Studio-FR-AI\Lemon-Studio-Assistant-IA.exe'
+          Copy-Item 'lemon_ai.py' 'Lemon-Studio-FR-AI\lemon_ai.py'
+          @'
+          LEMON STUDIO FR + ASSISTANT IA - PREVERSION
+
+          1. Decompressez integralement le ZIP dans un dossier Windows.
+          2. Fermez les anciennes fenetres de Lemon Studio.
+          3. Lancez Lemon-Studio-Assistant-IA.exe (pas lemonstudio.exe).
+          4. Le programme lance automatiquement Lemon Studio FR et la fenetre de chat.
+          5. Testez "Mets le tempo a 200 BPM" en mode local.
+          6. Acceptez ou refusez la proposition dans Lemon Studio.
+
+          Sans IA : commandes simples et gratuites, sans cle ni Internet.
+          ChatGPT et Claude : cle API payante requise. Aucune cle n'est sauvegardee.
+          Ollama : necessite son installation et un modele sur votre PC.
+          Un resume du projet n'est envoye aux IA en ligne qu'avec votre accord.
+          Ce n'est pas encore une fenetre integree dans Lemon Studio :
+          il s'agit d'un assistant compagnon experimental.
+
+          La validation des modifications doit toujours etre faite dans Lemon Studio.
+          Travaillez sur des copies de projets .flp. Logiciel en pre-alpha.
+          Le code source de l'assistant est inclus pour inspection et modification.
+          Projet original : https://github.com/ItsAlphaNeon/Lemon-Studio
+          Fork : https://github.com/dedmauhaze/Lemon-Studio
+          '@ | Set-Content -LiteralPath 'Lemon-Studio-FR-AI\LISEZ-MOI-ASSISTANT.txt' -Encoding utf8
+
+      - name: Publier Lemon Studio FR avec assistant IA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lemon-Studio-FR-Assistant-IA-Windows-x64
+          path: Lemon-Studio-FR-AI/
+          if-no-files-found: error
+          retention-days: 14
