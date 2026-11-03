@@ -1,0 +1,72 @@
+name: Lemon Studio - Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lemon-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout Lemon Studio
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Configure LLVM for libclang
+        shell: pwsh
+        run: |
+          $clang = 'C:\Program Files\LLVM\bin\libclang.dll'
+          if (-not (Test-Path $clang)) {
+            choco install llvm -y --no-progress
+          }
+          if (-not (Test-Path $clang)) {
+            throw 'LLVM libclang.dll introuvable'
+          }
+          'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> $env:GITHUB_ENV
+
+      - name: Compile Lemon Studio release executable
+        run: cargo build -p os-app --release --locked
+
+      - name: Prepare portable Windows package
+        shell: pwsh
+        run: |
+          $out = 'Lemon-Studio-Windows-x64'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item 'target\release\lemonstudio.exe' "$out\lemonstudio.exe"
+          Copy-Item 'LICENSE' "$out\LICENSE.txt"
+          Copy-Item 'THIRD-PARTY-NOTICES.txt' "$out\THIRD-PARTY-NOTICES.txt"
+          @'
+          LEMON STUDIO - WINDOWS 64 BITS (PRE-ALPHA)
+
+          Decompressez l'archive, puis lancez lemonstudio.exe.
+          Aucun outil de compilation a installer sur votre PC.
+          Version de test non officielle, compilee depuis le fork GitHub.
+          Ne remplacez jamais vos projets FL Studio originaux : testez des copies.
+          Les plugins VST3/CLAP distribues separement ne sont pas inclus.
+          La version portable peut afficher un avertissement SmartScreen.
+          Site source : https://github.com/ItsAlphaNeon/Lemon-Studio
+          '@ | Set-Content -Path "$out\LISEZ-MOI.txt" -Encoding UTF8
+          Get-ChildItem $out
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lemon-Studio-Windows-x64
+          path: Lemon-Studio-Windows-x64/
+          if-no-files-found: error
+          retention-days: 14
