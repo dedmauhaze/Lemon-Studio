@@ -1,0 +1,1886 @@
+name: Lemon Studio FR + IA Modern Mix V0.6 - Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-lemon-packs-modern-v06.yml'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  modern-windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
+      - name: Recuperer la version FR valide
+        uses: actions/download-artifact@v4
+        with:
+          name: Lemon-Studio-Windows-x64-FR
+          run-id: 41723186509
+          github-token: ${{ github.token }}
+          repository: dedmauhaze/Lemon-Studio
+          path: Lemon-Studio-FR-Modern
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generer et tester le moteur IA Modern Mix
+        shell: pwsh
+        run: |
+          @'
+          # -*- coding: utf-8 -*-
+          """Lemon Composer: local Ollama musical direction + deterministic, undoable Lemon Studio build.
+          No third-party Python dependencies. GPL-3.0-or-later; experimental, independent companion.
+          """
+          from __future__ import annotations
+          import json
+          import math
+          import os
+          from pathlib import Path
+          import random
+          import re
+          import struct
+          import urllib.error
+          import urllib.request
+          import wave
+          import unicodedata
+          import tempfile
+          
+          ROLE_ORDER = ("kick", "snare", "hat", "bass", "lead", "pad", "arp")
+          ROLE_NAMES = {"kick":"Kick", "snare":"Snare", "hat":"Hi-hat", "bass":"Basse", "lead":"Lead", "pad":"Accords", "arp":"Arpege"}
+          TONICS = {"C":0, "C#":1, "DB":1, "D":2, "D#":3, "EB":3, "E":4, "F":5, "F#":6, "GB":6, "G":7, "G#":8, "AB":8, "A":9, "A#":10, "BB":10, "B":11}
+          SCALE = {"minor":[0,2,3,5,7,8,10], "major":[0,2,4,5,7,9,11]}
+          MAX_BARS = 160
+          
+          # Automatic read-only discovery of folders already registered in Lemon Studio's Browser.
+          # AI compares shortlist labels + inexpensive WAV measurements; it does not hear the samples.
+          SAMPLE_EXTENSIONS = {'.wav', '.aif', '.aiff', '.flac', '.ogg', '.mp3'}
+          ROLE_TERMS = {
+              'kick': {'kick': 48, 'kicks': 45, 'bassdrum': 37, 'bd': 19, 'tok': 8},
+              'snare': {'snare': 46, 'snares': 44, 'clap': 34, 'rimshot': 22, 'rim': 15},
+              'hat': {'hihat': 48, 'hats': 43, 'hat': 42, 'cymbal': 25, 'shaker': 22, 'ride': 15},
+              'bass': {'reese': 42, 'bass': 38, 'sub': 27, 'rumble': 20, 'acid': 27, '808': 19},
+              'lead': {'lead': 44, 'leads': 42, 'supersaw': 40, 'saw': 22, 'melody': 27, 'melodie': 27, 'piano': 33, 'pluck': 28},
+              'pad': {'pad': 44, 'pads': 42, 'strings': 31, 'choir': 32, 'texture': 19, 'atmosphere': 29, 'chords': 34, 'chord': 32, 'skank': 53, 'guitar': 34, 'guitare': 34, 'rhythm': 25},
+              'arp': {'arp': 43, 'arpeggio': 46, 'arpeggiator': 37, 'pluck': 26, 'sequence': 19, 'organ': 45, 'orgue': 45, 'bubble': 52},
+          }
+          BAD_TOKENS = {'loop', 'loops', 'demo', 'preview', 'construction', 'song', 'track', 'full', 'mixdown', 'mix', 'vocal', 'voice'}
+          PERCUSSIVE = ('kick', 'snare', 'hat')
+          
+          # V0.6: Use usable *monitoring* levels, not the V0.5 double attenuation.
+          # 0.8 is Lemon Studio's master unity, 0.78125 is channel unity.
+          # These remain conservative initial mix values, NOT loudness normalization.
+          CHANNEL_ATTENUATION_DB = {
+              'kick': -2.0, 'snare': -6.0, 'hat': -8.0,
+              'bass': -5.0, 'lead': -6.0, 'pad': -9.0, 'arp': -8.0,
+          }
+          MASTER_ATTENUATION_DB = 0.0
+          
+          def _gain_from_db(db, unity):
+              return round(unity * 10 ** (db / 20.0), 6)
+          
+          def sample_safe_notes(part, notes, sample_path):
+              """Constrain polyphonic one-shot abuse and very large sample transpositions.
+          
+              Never rewrite original files. If a chord/skank file is selected, play one
+              trigger per MIDI onset (it likely already contains multiple notes). For
+              pitched one-shots keep MIDI near C5, avoiding 2+ octave shifts from sampler
+              root; note/key detection is still *not* implemented.
+              """
+              if part not in ('bass', 'lead', 'pad', 'arp') or not notes:
+                  return notes
+              tags = _tokens(Path(sample_path).stem)
+              chord_sample = bool(tags & {'chord', 'chords', 'skank', 'riff', 'phrase', 'progression', 'loop'})
+              if chord_sample:
+                  seen = set()
+                  out = []
+                  for n in notes:
+                      if n['position'] in seen:
+                          continue
+                      seen.add(n['position'])
+                      out.append({**n, 'key': 60, 'velocity': min(n['velocity'], 92)})
+                  return out
+              median = sorted(n['key'] for n in notes)[len(notes) // 2]
+              target = 55 if part == 'bass' else 60
+              shift = 12 * round((target - median) / 12)
+              out = []
+              for n in notes:
+                  key = n['key'] + shift
+                  while key < 48:
+                      key += 12
+                  while key > 72:
+                      key -= 12
+                  out.append({**n, 'key': key, 'velocity': min(n['velocity'], 110)})
+              return out
+          
+          
+          def _fold_label(text):
+              t = unicodedata.normalize('NFKD', text.lower())
+              return ''.join(c for c in t if not unicodedata.combining(c))
+          
+          
+          def _tokens(text):
+              return set(x for x in re.split(r'[^a-z0-9]+', _fold_label(text)) if x)
+          
+          
+          def discover_pack_roots(appdata=None):
+              """Read saved Lemon Studio Browser roots. No search outside user-registered folders."""
+              base = Path(appdata) if appdata else Path(os.getenv('APPDATA') or (Path.home() / 'AppData' / 'Roaming'))
+              file = base / 'Lemon Studio' / 'browser_folders.txt'
+              try:
+                  lines = file.read_text(encoding='utf-8-sig').splitlines()
+              except (OSError, UnicodeError):
+                  return []
+              roots = []
+              for line in lines:
+                  label = line.split('\t', 1)[0].strip().strip('"')
+                  if not label:
+                      continue
+                  root = Path(label).expanduser()
+                  if root.is_dir() and not root.is_symlink():
+                      try:
+                          root = root.resolve()
+                      except OSError:
+                          continue
+                      if root not in roots:
+                          roots.append(root)
+              return roots
+          
+          
+          def _wav_data(path):
+              """Read-only WAV duration and a short PCM16 sample to estimate RMS/peak; never edit audio."""
+              if path.suffix.lower() != '.wav':
+                  return None
+              try:
+                  with wave.open(str(path), 'rb') as w:
+                      channels, width, rate, frames = w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()
+                      if not (1 <= channels <= 8 and 8_000 <= rate <= 192_000 and frames > 0):
+                          return None
+                      duration = round(frames/rate, 3)
+                      result = {'duration':duration, 'channels':channels, 'rate':rate}
+                      if width == 2:
+                          data=w.readframes(min(frames, rate // 8))
+                          # Compute only a small window of samples to keep scanning fast.
+                          from array import array
+                          values=array('h');values.frombytes(data)
+                          if os.sys.byteorder != 'little':
+                              values.byteswap()
+                          if values:
+                              result['peak'] = round(max(abs(v) for v in values)/32768,3)
+                              result['rms'] = round(math.sqrt(sum(float(v)*v for v in values)/len(values))/32768,3)
+                      return result
+              except (wave.Error, EOFError, OSError, ValueError):
+                  return None
+          
+          
+          def _rank_candidate(path, role, root, mood='', info=None):
+              name = _tokens(path.stem)
+              ancestry = set()
+              current=path.parent
+              for _ in range(3):
+                  if current == root.parent:
+                      break
+                  ancestry.update(_tokens(current.name))
+                  if current == root:
+                      break
+                  current=current.parent
+              score = 0
+              terms = ROLE_TERMS[role]
+              for t, weight in terms.items():
+                  if t in name:
+                      score=max(score,weight)
+                  elif t in ancestry:
+                      score=max(score,int(weight*.68))
+              if score < 13:
+                  return 0
+              if name & BAD_TOKENS:
+                  return 0
+              # Avoid confusing sample roles: e.g. a Frenchcore kick named "bass kick" is not a melodic bass.
+              if role != 'kick' and 'kick' in name:
+                  return 0
+              if role in ('lead','pad','arp') and name & {'snare','clap','hat','hihat','kick','cymbal'}:
+                  return 0
+              if role in PERCUSSIVE and name & {'lead','pad','melody','piano','bassline','arp','chords'}:
+                  return 0
+              is_reggae = infer_style(mood) == 'reggae'
+              is_hard = bool(name & {'frenchcore','hardcore','uptempo','hardstyle'} or ancestry & {'frenchcore','hardcore','uptempo','hardstyle'})
+              if is_hard:
+                  score += 14 if infer_style(mood) == 'frenchcore' else (-20 if is_reggae else 0)
+              if is_reggae:
+                  if name & {'reggae','roots','dub','jamaican'} or ancestry & {'reggae','roots','dub'}:
+                      score += 20
+                  if role == 'pad' and name & {'guitar','guitare','skank','chop'}:
+                      score += 20
+                  if role == 'arp' and name & {'organ','orgue','bubble'}:
+                      score += 23
+                  if role == 'bass' and name & {'warm','deep','round','roots','reggae'}:
+                      score += 12
+                  if role == 'hat' and name & {'shaker','hihat','hat'}:
+                      score += 8
+              if name & {'oneshot','one','shot','single'} or ancestry & {'oneshots','oneshot','shots'}:
+                  score+=4
+              if path.suffix.lower()=='.wav':
+                  score+=5
+              if info:
+                  duration=info.get('duration',0)
+                  if duration >= 16 or (role in PERCUSSIVE and duration > 8):
+                      return 0  # most likely a full loop, not a one-shot
+                  if role=='kick' and .08 <= duration <= 3.5:
+                      score+=5
+                      if not is_reggae:
+                          if .18 <= duration <= .65:
+                              score+=12
+                          elif duration > 1.5:
+                              score-=35  # especially risky at Frenchcore 200 BPM
+                          elif duration > .85:
+                              score-=12
+                  if role=='snare' and .04 <= duration <= 2.0:score+=4
+                  if role=='hat' and .02 <= duration <= 1.2:score+=4
+                  if role in ('lead','pad','arp','bass') and .1 <= duration <= 10:score+=3
+                  if info.get('rms',0) < .0001 and info.get('peak',1) < .0005:
+                      return 0
+              return score
+          
+          
+          def find_pack_candidates(roots, prompt, *, max_files=60_000, finalists=5):
+              """Search *all* saved packs automatically. Keep a small ranked candidate list per role."""
+              roots = [Path(p) for p in roots if Path(p).is_dir()]
+              if not roots:
+                  raise ValueError('Aucun dossier de pack trouvé. Ajoute ton dossier de samples dans le Browser de Lemon Studio, puis réessaie.')
+              pools={role:[] for role in ROLE_ORDER}
+              seen=0
+              for root in roots:
+                  for parent, dirs, files in os.walk(root, followlinks=False):
+                      dirs[:]=sorted(d for d in dirs if d not in ('__MACOSX', '.git', 'node_modules') and not d.startswith('.') and not (Path(parent)/d).is_symlink())
+                      for filename in sorted(files):
+                          p=Path(parent)/filename
+                          if p.suffix.lower() not in SAMPLE_EXTENSIONS or p.is_symlink():
+                              continue
+                          seen+=1
+                          if seen>max_files:
+                              raise ValueError(f'Plus de {max_files} samples détectés. Réduis le nombre de dossiers dans le Browser pour éviter un scan interminable.')
+                          try:
+                              if not 1024 <= p.stat().st_size <= 120_000_000:
+                                  continue
+                          except OSError:
+                              continue
+                          role_scores={role:_rank_candidate(p,role,root,mood=prompt) for role in ROLE_ORDER}
+                          if not any(role_scores.values()):
+                              continue
+                          audio=_wav_data(p)
+                          for role in ROLE_ORDER:
+                              score=_rank_candidate(p,role,root,mood=prompt,info=audio)
+                              if score:
+                                  pools[role].append({'path':str(p),'score':score,'audio':audio or {},'root':str(root)})
+              ranked={role:sorted(items,key=lambda a:(-a['score'],a['path'].lower()))[:finalists] for role,items in pools.items()}
+              return ranked,seen
+          
+          
+          def choose_samples_local(ranked):
+              """Deterministic fallback when the local language model is unavailable or gives invalid indices."""
+              chosen={};used=set()
+              for role in ROLE_ORDER:
+                  for item in ranked.get(role,[]):
+                      p=item['path']
+                      if p not in used:
+                          chosen[role]=p;used.add(p);break
+              return chosen
+          
+          
+          def choose_samples_ollama(ranked, prompt, model):
+              """Qwen chooses from a prevalidated local shortlist: never accepts invented paths."""
+              defaults=choose_samples_local(ranked)
+              if not defaults:
+                  return {},'aucun sample pertinent'
+              options={role:[{'n':i,'file':Path(item['path']).name,'folder':Path(item['path']).parent.name,
+                              'duration_s':item['audio'].get('duration'),'score':item['score']} for i,item in enumerate(items)]
+                       for role,items in ranked.items() if items}
+              system=('Tu sélectionnes des one-shots musicaux adaptés au STYLE exact du prompt, notamment le reggae, le dub et la Frenchcore. '
+                      'Choisis uniquement parmi les indices des candidats proposés, sans inventer de fichier. '
+                      'Pour du reggae, préfère des samples roots, kick doux, snare/rimshot, shaker, basse profonde, guitare skank et orgue bubble. Pour de la Frenchcore, choisis des kicks distordus et leads puissants; '
+                      'préfère les one-shots. Réponds seulement en JSON, par exemple '
+                      '{"kick":0,"snare":1,"hat":0,"bass":0,"lead":2,"pad":0,"arp":0}. '
+                      'Omet les rôles sans candidats. Ne donne aucun chemin, ni instruction.')
+              data=json.dumps({'prompt':prompt[:800],'candidats':options},ensure_ascii=False)
+              req={'model':model,'stream':False,'format':'json','prompt':system+'\n'+data,
+                   'options':{'temperature':0.1,'num_predict':340},'keep_alive':'10m'}
+              call=urllib.request.Request('http://127.0.0.1:11434/api/generate',
+                   data=json.dumps(req,ensure_ascii=False).encode('utf-8'),
+                   headers={'Content-Type':'application/json'},method='POST')
+              try:
+                  with urllib.request.urlopen(call,timeout=110) as resp:
+                      raw=json.loads(resp.read(1_000_000).decode('utf-8')).get('response','')
+                  proposed=extract_json(raw)
+                  picked={};used=set()
+                  for role in ROLE_ORDER:
+                      idx=proposed.get(role)
+                      candidates=ranked.get(role,[])
+                      if type(idx) is int and 0<=idx<len(candidates):
+                          p=candidates[idx]['path']
+                          if p not in used:
+                              picked[role]=p;used.add(p)
+                  # Model can ignore roles; use deterministic picks for each missing role.
+                  for role in ROLE_ORDER:
+                      if role in picked:continue
+                      for item in ranked.get(role,[]):
+                          if item['path'] not in used:
+                              picked[role]=item['path'];used.add(item['path']);break
+                  return picked,'sélection Qwen + classement des fichiers'
+              except (urllib.error.HTTPError,urllib.error.URLError,TimeoutError,ValueError,TypeError,KeyError,OSError) as exc:
+                  return defaults,'classement automatique (Qwen : '+str(exc)[:100]+')'
+          
+          
+          def _small(text, limit=80):
+              if not isinstance(text, str):
+                  return ""
+              return "".join(c for c in text if c.isprintable())[:limit].strip()
+          
+          
+          def extract_json(text):
+              if not isinstance(text, str):
+                  raise ValueError("Réponse du modèle absente")
+              idx = text.find("{")
+              if idx < 0:
+                  raise ValueError("Ollama n'a pas renvoyé le plan JSON attendu")
+              try:
+                  obj, _ = json.JSONDecoder().raw_decode(text[idx:])
+              except json.JSONDecodeError as e:
+                  raise ValueError("Le plan musical renvoyé par Ollama n'est pas un JSON valide") from e
+              if not isinstance(obj, dict):
+                  raise ValueError("Le plan musical doit être un objet JSON")
+              return obj
+          
+          
+          def infer_style(prompt):
+              '''Explicit genre names take precedence over anything the language model guesses.'''
+              t = _fold_label(str(prompt or ''))
+              if re.search(r'\b(reggae|ragga|one[- ]drop|roots reggae|dub reggae|ska|skank)\b', t):
+                  return 'reggae'
+              if re.search(r'\b(frenchcore|hardcore|uptempo|hardstyle|rawstyle)\b', t):
+                  return 'frenchcore'
+              if re.search(r'\b(hip[- ]?hop|boom[- ]?bap|trap|rap)\b', t):
+                  return 'hiphop'
+              if re.search(r'\b(house|techno|trance|dance)\b', t):
+                  return 'dance'
+              return 'generic'
+          
+          
+          
+          def reggae_groove(prompt, bpm):
+              """Roots keeps One Drop; faster reggae-disco/dancehall has a different drum pocket."""
+              t = _fold_label(str(prompt))
+              if re.search(r'\b(one[- ]drop|roots|traditionnel|traditional|dub roots)\b', t):
+                  return 'one_drop'
+              if re.search(r'\b(disco|dancehall|crossover|modern|moderne|dansant|rapide|fast|festif|groove rapide)\b', t) or bpm >= 108:
+                  return 'reggae_disco'
+              return 'one_drop'
+          
+          def infer_bpm(prompt):
+              m = re.search(r"\b(\d{2,3})\s*bpm\b", prompt, re.I)
+              if m:
+                  return max(60, min(240, int(m.group(1))))
+              return {'reggae':78, 'frenchcore':195, 'hiphop':92, 'dance':128, 'generic':140}[infer_style(prompt)]
+          
+          
+          def infer_seconds(prompt, bpm):
+              m = re.search(r"\b(\d{1,2})\s*(?:min(?:utes?)?|mn)\b", prompt.lower())
+              if m:
+                  return max(30, min(240, int(m.group(1))*60))
+              m = re.search(r"\b(\d{2,3})\s*(?:sec(?:ondes?)?|s)\b", prompt.lower())
+              if m:
+                  return max(30, min(240, int(m.group(1))))
+              return 90
+          
+          
+          def plan_from_ollama(prompt, model, state):
+              if not model or not isinstance(model, str):
+                  raise ValueError("Indique le modèle Ollama (ex. qwen2.5:7b-instruct)")
+              sys_prompt = '''Tu es un arrangeur et compositeur musical. Transforme la demande en plan de composition pour un DAW.
+          Réponds exclusivement par un objet JSON, sans commentaire et sans markdown:
+          {"title":"Reggae Roots","style":"reggae","bpm":78,"tonic":"G","scale":"major","mood":"chaleureux","progression":[0,3,4,0],"motif":[0,2,4,3,2,0,4,2],"energy":0.65}
+          Toutes les valeurs doivent être simples. tonic = C,C#,D,D#,E,F,F#,G,G#,A,A#,B; scale = minor ou major.
+          style = reggae, frenchcore, hiphop, dance ou generic. Respecte impérativement le genre donné.
+          REGGAE : pour reggae ROOTS traditionnel, One Drop (kick + snare sur le 3e temps), skank en contretemps, orgue bubble, basse syncopée. Pour reggae DISCO/dancehall rapide, privilégie un backbeat dansant et des contretemps ; ne force pas le One Drop. Évite de confondre avec un kick techno.
+          FRENCHCORE : kick sur chaque temps, basse énergique, lead rapide, break et drop.
+          progression = quatre degrés ENTIERs de 0 à 6; motif = huit degrés ENTIERs de 0 à 13.
+          Ne renvoie jamais de commandes système, d'instructions, de chemins ni de code. Sélectionne un tempo, une tonalité et un motif adaptés à la demande.'''
+              req = {
+                  "model": model[:100], "stream": False, "format": "json",
+                  "prompt": sys_prompt + "\nDemande de l'utilisateur: " + prompt[:2200] + "\nBPM actuel: " + str(state.get("tempo", "inconnu")),
+                  "options": {"temperature": 0.25, "num_predict": 480},
+                  "keep_alive": "10m"
+              }
+              data = json.dumps(req, ensure_ascii=False).encode("utf-8")
+              http = urllib.request.Request("http://127.0.0.1:11434/api/generate", data=data, headers={"Content-Type":"application/json"}, method="POST")
+              try:
+                  with urllib.request.urlopen(http, timeout=180) as response:
+                      result = json.loads(response.read(1_000_000).decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  detail = e.read(500).decode("utf-8", "replace")
+                  raise RuntimeError(f"Ollama HTTP {e.code} : {detail}") from None
+              except (urllib.error.URLError, TimeoutError) as e:
+                  raise RuntimeError(f"Ollama n'est pas joignable ou le calcul a pris trop de temps : {e}") from None
+              return extract_json(result.get("response", ""))
+          
+          
+          def normalize(raw, prompt):
+              """Allowlist the model's musical metadata; never translate its output into arbitrary RPC commands."""
+              if not isinstance(raw, dict):
+                  raise ValueError("Le modèle n'a pas envoyé de plan musical")
+              bpm = infer_bpm(prompt)
+              # An explicit BPM from the user always wins over the model.
+              if not re.search(r"\b\d{2,3}\s*bpm\b", prompt, re.I):
+                  try:
+                      bpm = max(60, min(240, int(raw.get("bpm", bpm))))
+                  except (ValueError, TypeError):
+                      pass
+              style_hint = infer_style(prompt)
+              if style_hint == 'reggae' and not re.search(r"\b\d{2,3}\s*bpm\b", prompt, re.I):
+                  # The model may ignore the requested groove and hallucinate a dance tempo.
+                  bpm = max(60, min(110, bpm))
+              tonic = str(raw.get("tonic", "G" if style_hint == 'reggae' else "A")).upper().replace("♯", "#").replace("♭", "B")
+              if tonic not in TONICS:
+                  tonic = "A"
+              scale = str(raw.get("scale", "minor")).lower()
+              if scale not in SCALE:
+                  scale = "minor"
+              def degrees(x, n, fallback, hi):
+                  if not isinstance(x, list) or len(x) != n:
+                      return fallback
+                  if not all(type(a) is int and 0 <= a <= hi for a in x):
+                      return fallback
+                  return x
+              progression = degrees(raw.get("progression"), 4, [0,5,2,6] if scale == "minor" else [0,4,5,3], 6)
+              motif = degrees(raw.get("motif"), 8, [0,2,4,5,4,2,1,0], 13)
+              energy = raw.get("energy", 0.8)
+              if isinstance(energy, bool) or not isinstance(energy, (int,float)) or not math.isfinite(energy):
+                  energy = 0.8
+              energy = max(0.35,min(1.0,float(energy)))
+              # Never let a hallucinated style override a genre explicitly requested in French.
+              style = infer_style(prompt)
+              if style == 'generic':
+                  candidate = str(raw.get('style','generic')).lower().strip()
+                  style = candidate if candidate in ('reggae','frenchcore','hiphop','dance','generic') else 'generic'
+              seconds = infer_seconds(prompt,bpm)
+              bars = max(32, min(MAX_BARS, round((seconds * bpm / 240) / 4) * 4))
+              return {"title":_small(raw.get("title"),65) or "Composition automatique", "bpm":bpm, "tonic":tonic,
+                      "scale":scale,"progression":progression,"motif":motif,"energy":energy,"bars":bars,
+                      "seconds":round(bars*240/bpm),"mood":_small(raw.get("mood"),80),"style":style,
+                      "groove":reggae_groove(prompt,bpm) if style == 'reggae' else 'modern'}
+          
+          
+          
+          def modern_section_lengths(total_bars, style='frenchcore'):
+              """8 sections with short intros, distinct drops and a genuine melodic break.
+          
+              Integer rounding preserves the 4-bar grid and total length for 30s-4m demos.
+              """
+              weight = ((0.05, 0.10, 0.09, 0.24, 0.15, 0.09, 0.22, 0.06) if style == 'frenchcore'
+                        else (0.05, 0.15, 0.13, 0.13, 0.11, 0.11, 0.22, 0.10))
+              chunks = max(8, total_bars // 4)
+              out = [1] * 8
+              remaining = chunks - 8
+              for _ in range(remaining):
+                  i = max(range(8), key=lambda j: (weight[j]*chunks - out[j], weight[j]))
+                  out[i] += 1
+              assert sum(out) == chunks
+              return [4*n for n in out]
+          
+          
+          def modern_section_labels(cfg):
+              if cfg.get('style') == 'reggae':
+                  if cfg.get('groove') == 'reggae_disco':
+                      return ('Intro courte', 'Groove', 'Hook', 'Variation', 'Break instrumental', 'Relance', 'Refrain final', 'Outro')
+                  return ('Intro courte', 'Couplet', 'Hook', 'Variation', 'Dub break', 'Relance', 'Dernier refrain', 'Outro')
+              if cfg.get('style') == 'frenchcore':
+                  return ('Intro hook', 'Teaser melodique', 'Montee 1', 'Drop A', 'Break melodique', 'Montee 2', 'Drop B - variation', 'Outro')
+              return ('Intro', 'Theme', 'Montee', 'Partie A', 'Break', 'Reprise', 'Final', 'Outro')
+          
+          def section_lengths(total_bars):
+              """8 proportional sections, each multiple of 4 bars, sum exactly total_bars."""
+              weights = (0.08,0.12,0.12,0.22,0.13,0.12,0.16,0.05)
+              chunks = total_bars // 4
+              out = [max(1,round(chunks*x)) for x in weights]
+              while sum(out)>chunks:
+                  idx=max((i for i,v in enumerate(out) if v>1),key=lambda i:out[i],default=None)
+                  if idx is None:break
+                  out[idx]-=1
+              while sum(out)<chunks:
+                  i=max(range(len(weights)),key=lambda j:(chunks*weights[j]-out[j],weights[j]))
+                  out[i]+=1
+              assert sum(out)==chunks
+              return [k*4 for k in out]
+          
+          
+          def _semid(tonic, scale, deg):
+              sc=SCALE[scale]
+              return TONICS[tonic]+sc[deg%7]+12*(deg//7)
+          
+          
+          def note(channel, position,length,key,velocity=100):
+              return {"channel":int(channel),"position":int(position),"length":max(1,int(length)),
+                      "key":max(0,min(127,int(key))),"velocity":max(1,min(128,int(velocity))),"pan":64}
+          
+          
+          
+          
+          def _reggae_section_notes(part, section_index, bars, ppq, cfg, channel):
+              """Real reggae rhythmic vocabulary (1 bar = 4 beats):
+          
+              * One Drop: kick and snare TOGETHER on beat three, not four-on-the-floor.
+              * Skank: short triads at each offbeat (the 'and' of 1, 2, 3, 4).
+              * Organ bubble: offbeat chords plus occasional sixteenth-note pickup.
+              * Bass: long roots, syncopated anticipations; not a 4/4 techno bass.
+              The pattern is MIDI only. Sample quality/tuning still depends on the packs.
+              """
+              beat=ppq
+              bar=4*beat
+              half=beat//2
+              quarter=max(1,beat//4)
+              rng=random.Random(835_727 + section_index*997 + sum(ord(x) for x in part))
+              tonic,mode=cfg['tonic'],cfg['scale']
+              progression=cfg['progression']
+              motif=cfg['motif']
+              energy=[0.38,0.64,0.76,0.92,0.33,0.74,0.91,0.28][section_index] * cfg.get('energy',0.8)
+              out=[]
+              def emit(pos,length,key,velocity):
+                  out.append(note(channel,pos,length,key,velocity))
+              for b in range(bars):
+                  start=b*bar
+                  degree=progression[(b//2 + section_index)%4]
+                  root=_semid(tonic,mode,degree)
+                  gentle=section_index in (0,4,7)
+                  if part=='kick':
+                      # One Drop: third beat ONLY. In breaks the groove stays soft.
+                      emit(start+2*beat,max(1,int(.30*beat)),60,85 if gentle else 105)
+                  elif part=='snare':
+                      # Snare or rimshot shares the kick's third beat.
+                      emit(start+2*beat,max(1,int(.28*beat)),60,76 if gentle else 102)
+                  elif part=='hat':
+                      # Upbeat eighths with velocity movement; never a constant 16th techno roll.
+                      for k in range(4):
+                          off=start+k*beat+half
+                          emit(off,max(1,int(.22*beat)),60,50+rng.randint(0,13)+(8 if k==2 else 0))
+                          if not gentle and b%2==1 and k in (1,3):
+                              emit(start+k*beat,max(1,int(.13*beat)),60,35+rng.randint(0,9))
+                  elif part=='bass':
+                      # Roots on one, and the anticipated 'and of two/and of four'.
+                      key=max(0,min(127,36+root))
+                      emit(start,max(1,int(1.35*beat)),key,84 if gentle else 103)
+                      if not gentle:
+                          emit(start+beat+half,max(1,int(.65*beat)),key,92)
+                          if b%2==1:
+                              next_degree=progression[((b+1)//2+section_index)%4]
+                              approach=max(0,min(127,36+_semid(tonic,mode,next_degree)))
+                              emit(start+3*beat+half,max(1,int(.41*beat)),approach,75)
+                      elif b%2:
+                          emit(start+3*beat+half,max(1,int(.35*beat)),key+7,59)
+                  elif part=='pad':
+                      # Guitar/keys skank: staccato chords on EVERY offbeat.
+                      # A pre-recorded chord sample may not transpose reliably; report this to users.
+                      if section_index not in (0,7):
+                          for k in range(4):
+                              if gentle and k in (0,2):
+                                  continue
+                              pos=start+k*beat+half
+                              for d in (degree,degree+2,degree+4):
+                                  emit(pos,max(1,int(.18*beat)),60+_semid(tonic,mode,d),66 if gentle else 79+(k==2)*6)
+                  elif part=='arp':
+                      # Reggae organ bubble: light repeated offbeats and an occasional
+                      # slightly earlier 16th pickup into the next upbeat, not EDM arpeggios.
+                      if section_index not in (0,7):
+                          for k in (0,1,2,3):
+                              if gentle and k%2==1:continue
+                              pos=start+k*beat+half
+                              for d in (degree,degree+2,degree+4):
+                                  emit(pos,max(1,int(.16*beat)),60+_semid(tonic,mode,d),56 if gentle else 69)
+                              if not gentle and k in (1,3) and b%2==0:
+                                  emit(start+k*beat+quarter,max(1,int(.11*beat)),60+_semid(tonic,mode,degree+2),48)
+                  elif part=='lead':
+                      # Spacious, singable melodic phrasing, often answering the skank.
+                      if gentle:
+                          if b%2==0:
+                              d=motif[(b//2)%8]
+                              emit(start+beat+half,max(1,int(1.2*beat)),60+_semid(tonic,mode,d),71)
+                      else:
+                          for k in (0,2,3):
+                              if k==3 and b%2==0:continue
+                              d=motif[(2*b+k+section_index)%8]
+                              pos=start+k*beat+(half if k in (0,3) else 0)
+                              emit(pos,max(1,int(.65*beat)),60+_semid(tonic,mode,d),73+rng.randint(0,13))
+              return out
+          
+          
+          
+          def _modern_frenchcore_notes(part, sec, bars, ppq, cfg, channel):
+              """Modern-ish arrangement skeleton: early hook, builds with rolls, contrasting
+              drop A/B, half-time melodic break, fills & pauses every 4/8 bars.
+              Deliberately MIDI-only: cannot synthesize contemporary sound design or mix stems.
+              """
+              beat, bar = ppq, ppq*4
+              eighth=max(1,beat//2); sixteenth=max(1,beat//4)
+              motif=cfg['motif']; prog=cfg['progression']; tonic=cfg['tonic']; mode=cfg['scale']
+              rng=random.Random(14159 + 307*sec + sum(ord(c) for c in part))
+              out=[]
+              def emit(p,length,key,vel):
+                  out.append(note(channel,p,max(1,int(length)),key,int(vel)))
+              for b in range(bars):
+                  start=b*bar
+                  deg=prog[((b//2)+(sec//2))%4]
+                  root=_semid(tonic,mode,deg)
+                  last_bar=b==bars-1
+                  turnaround=(b%8==7)
+                  intro=sec in (0,7)
+                  build=sec in (2,5)
+                  drop=sec in (3,6)
+                  break_part=sec==4
+                  teaser=sec==1
+                  energy=min(1.0,cfg.get('energy',0.8))
+                  if part=='kick':
+                      if drop:
+                          hits=(0,1,2,3)
+                      elif build:
+                          hits=(0,2) if b<bars//2 else (0,1,2,3)
+                      elif teaser:
+                          hits=(0,2) if b%2==0 else (0,)
+                      elif sec==7:
+                          hits=(0,2) if b<bars//2 else (0,)
+                      else:
+                          hits=()  # a real quiet intro or emotional melodic break
+                      for k in hits:
+                          # Create a one-beat empty breath before the last drop's pickup.
+                          if last_bar and build and k==3:
+                              continue
+                          emit(start+k*beat,beat*.28,60,108 if k==0 else 101)
+                  elif part=='snare':
+                      if drop or teaser:
+                          for k in (1,3):
+                              emit(start+k*beat,beat*.21,60,96 if k==3 else 84)
+                          if drop and turnaround:
+                              emit(start+3*beat+eighth,beat*.11,60,64)
+                      elif build:
+                          for k in (1,3):emit(start+k*beat,beat*.20,60,88)
+                          if b >= bars//2:
+                              step=eighth if b<bars-2 else sixteenth
+                              for pos in range(2*beat,bar,step):
+                                  # Rising roll in last bars, not a 16th loop for 3 minutes.
+                                  emit(start+pos,step*.22,60,65+int(30*pos/bar))
+                      elif sec==7 and b%2==0:
+                          emit(start+3*beat,beat*.24,60,65)
+                  elif part=='hat':
+                      if drop:
+                          for k in range(8):
+                              if k%2==1 or b%2==0:
+                                  emit(start+k*eighth,eighth*.21,60,51+rng.randrange(22))
+                          if turnaround:
+                              for k in range(12,16):
+                                  emit(start+k*sixteenth,sixteenth*.16,60,48+rng.randrange(22))
+                      elif build:
+                          step=eighth if b<bars-2 else sixteenth
+                          for pos in range(0,bar,step):
+                              emit(start+pos,step*.19,60,40+rng.randrange(20))
+                      elif teaser:
+                          for k in (1,3,5,7):emit(start+k*eighth,eighth*.20,60,50+rng.randrange(14))
+                      elif sec==7 and b%2==0:
+                          for k in (1,5):emit(start+k*eighth,eighth*.20,60,40)
+                  elif part=='bass':
+                      key=max(0,min(127,36+root))
+                      if drop:
+                          # Offbeat root+fifth phrases leave room for the kick tail.
+                          for k in (0,1,2,3):
+                              if k==3 and (b%4==3):
+                                  emit(start+k*beat+eighth,beat*.33,key+7,80)
+                              else:
+                                  emit(start+k*beat+eighth,beat*.31,key,87+(k==0)*5)
+                      elif teaser:
+                          for k in (0,2):emit(start+k*beat+eighth,beat*.38,key,79)
+                      elif build:
+                          for k in (0,2):emit(start+k*beat,beat*.42,key,73)
+                      elif break_part:
+                          if b%2==0:emit(start,beat*1.6,key,70)
+                  elif part=='lead':
+                      if drop or teaser:
+                          # Distinct rhythmic vocabulary in Drop B; motif A returns transformed.
+                          rhythm = ((0,.75,1.5,2.25,3.0,3.5) if sec!=6
+                                    else (0,.5,1.25,2.0,2.75,3.25))
+                          if teaser:
+                              rhythm=(0,1.5,2.5) if b%2==0 else (0,2.25,3)
+                          for k,at in enumerate(rhythm):
+                              # Phrase openings and short rests create 2/4/8-bar hooks.
+                              if drop and b%4==3 and k in (1,4):continue
+                              md=(b//2*3+k+(2 if sec==6 else 0))%8
+                              degree=motif[md]
+                              if sec==6 and turnaround and k>=len(rhythm)-2:
+                                  degree=min(13,degree+2)
+                              dur=beat*(.46 if at%1 else .62)
+                              emit(start+round(at*beat),dur,60+_semid(tonic,mode,degree),
+                                   78+rng.randrange(17)+int(energy*7))
+                      elif break_part:
+                          if b%2==0:
+                              k=(b//2)%8
+                              emit(start,beat*2.1,60+_semid(tonic,mode,motif[k]),74)
+                              emit(start+round(2.5*beat),beat*1.1,60+_semid(tonic,mode,motif[(k+2)%8]),69)
+                      elif build:
+                          # Gradually reveal the hook while build-up accelerates.
+                          count=2 if b<bars//2 else 4
+                          for k in range(count):
+                              at=(k*2+1)*eighth if count==2 else k*beat
+                              degree=motif[(b+k+sec)%8]
+                              emit(start+at,beat*.39,60+_semid(tonic,mode,degree),71+3*k)
+                      elif sec==0 and b%2==0:
+                          emit(start+2*beat,beat*1.2,60+_semid(tonic,mode,motif[(b//2)%8]),65)
+                  elif part=='pad':
+                      if (b%2==0) and not (sec==7 and b>=bars//2):
+                          if sec==0 or break_part:
+                              duration=bar*1.9
+                              vel=66
+                          elif drop:
+                              duration=bar*1.6
+                              vel=58
+                          else:
+                              duration=bar*1.6
+                              vel=57
+                          for d in (deg,deg+2,deg+4):
+                              emit(start,duration,48+_semid(tonic,mode,d),vel)
+                  elif part=='arp':
+                      if drop or build:
+                          count=4 if drop else (2 if b<bars//2 else 4)
+                          for k in range(count):
+                              # Stabs and answering notes, instead of endless eighth-note arp.
+                              at=(k+.5)*beat if drop else (k*4/count+.5)*beat
+                              d=deg+(0,2,4,2)[k]
+                              emit(start+round(at),beat*.28,60+_semid(tonic,mode,d),56+rng.randrange(19))
+                      elif sec==0 and b%4==3:
+                          emit(start+3*beat,beat*.5,60+_semid(tonic,mode,deg+4),51)
+              return out
+          
+          
+          def _reggae_disco_notes(part, sec, bars, ppq, cfg, channel):
+              """Faster crossover: 2/4 backbeat, syncopated bass, offbeat skank.
+              Does not pretend to reproduce any particular commercial song.
+              """
+              if part not in ('kick','snare','hat'):
+                  return _reggae_section_notes(part,sec,bars,ppq,cfg,channel)
+              beat=ppq; bar=ppq*4; half=max(1,ppq//2)
+              out=[];rng=random.Random(2331+sec*91+sum(map(ord,part)))
+              for b in range(bars):
+                  base=b*bar; gentle=sec in (0,4,7)
+                  if part=='kick':
+                      hits=(0,2) if gentle else (0,1.5,2,3.5)
+                      for at in hits:
+                          out.append(note(channel,base+round(at*beat),round(.3*beat),60,90 if gentle else 105))
+                  elif part=='snare':
+                      for at in ((3,) if gentle else (1,3)):
+                          out.append(note(channel,base+round(at*beat),round(.25*beat),60,78 if gentle else 98))
+                      if sec in (2,5) and b==bars-1:
+                          for k in range(4):
+                              out.append(note(channel,base+3*beat+k*max(1,beat//4),round(.13*beat),60,65+8*k))
+                  else:
+                      for k in range(8):
+                          if gentle and k%2==0: continue
+                          out.append(note(channel,base+k*half,round(.22*beat),60,47+rng.randrange(22)))
+              return out
+          
+          def _hiphop_section_notes(part, section_index, bars, ppq, cfg, channel):
+              """Boom-bap/trap starter skeleton: halftime snares, syncopated kick and hats."""
+              if part not in ('kick','snare','hat'):
+                  return None
+              beat=ppq;bar=4*beat;out=[]
+              rng=random.Random(1900+section_index*13+sum(map(ord,part)))
+              for b in range(bars):
+                  start=b*bar
+                  if part=='kick':
+                      for x in (0, int(1.5*beat), int(2.75*beat)):
+                          if x>0 and section_index in (0,4,7):continue
+                          out.append(note(channel,start+x,int(.25*beat),60,96))
+                  elif part=='snare':
+                      for x in (beat,3*beat):
+                          out.append(note(channel,start+x,int(.3*beat),60,92))
+                  else:
+                      for j in range(8):
+                          if section_index in (0,4,7) and j%2:continue
+                          out.append(note(channel,start+j*(beat//2),int(.13*beat),60,48+rng.randrange(22)))
+              return out
+          
+          def section_notes(part, section_index, bars, ppq, cfg, channel):
+              """Procedural MIDI: style rules take precedence over generic four-on-the-floor."""
+              if cfg.get('style') == 'reggae':
+                  if cfg.get('groove') == 'reggae_disco':
+                      return _reggae_disco_notes(part,section_index,bars,ppq,cfg,channel)
+                  return _reggae_section_notes(part,section_index,bars,ppq,cfg,channel)
+              if cfg.get('style') == 'frenchcore':
+                  return _modern_frenchcore_notes(part,section_index,bars,ppq,cfg,channel)
+              if cfg.get('style') == 'hiphop':
+                  hiphop = _hiphop_section_notes(part,section_index,bars,ppq,cfg,channel)
+                  if hiphop is not None:
+                      return hiphop
+              beat = ppq
+              bar = 4*beat
+              rng=random.Random(4021+section_index*77+sum(map(ord,part)))
+              prog=cfg["progression"]
+              motif=cfg["motif"]
+              tonic,mode=cfg["tonic"],cfg["scale"]
+              # Intro, theme, build, drop, break, re-build, final drop, outro.
+              density=[0.27,0.65,0.75,1.0,0.32,0.77,1.0,0.23][section_index]
+              out=[]
+              def emit(pos,dur,key,vel):out.append(note(channel,pos,dur,key,vel))
+              for b in range(bars):
+                  start=b*bar
+                  deg=prog[(b//2+section_index)%4]
+                  root=_semid(tonic,mode,deg)
+                  # The kick and snare are sample one-shots (key 60).
+                  if part=="kick":
+                      if section_index in (0,4,7):
+                          hits=[0,2] if b%2==0 else [0]
+                      else:
+                          hits=[0,1,2,3]
+                      for i in hits:emit(start+i*beat,int(beat*.28),60,104 if i==0 else 98)
+                  elif part=="snare":
+                      if density>.55:
+                          for k in (1,3):emit(start+k*beat,int(beat*.24),60,88 if k==1 else 104)
+                      elif b%2==1:emit(start+3*beat,int(beat*.24),60,80)
+                  elif part=="hat":
+                      step=beat//2 if density>.6 else beat
+                      for pos in range(0,bar,step):
+                          if rng.random() < density*.86:
+                              emit(start+pos,max(1,step//3),60,53+rng.randrange(24))
+                  elif part=="bass":
+                      bass_root=36+root  # A2 ~= 45
+                      if section_index in (0,4,7):
+                          emit(start,int(beat*2),bass_root,75)
+                          if b%2==0:emit(start+2*beat,beat,bass_root+12,65)
+                      else:
+                          for k in range(4):
+                              key=bass_root+(12 if k==3 and b%4==3 else 0)
+                              emit(start+k*beat,int(beat*.78),key,90+(k==0)*9)
+                  elif part=="lead":
+                      if section_index in (0,7):
+                          if b%2==0:
+                              idx=(b//2)%8
+                              emit(start,int(beat*2),60+_semid(tonic,mode,motif[idx]),80)
+                      elif section_index==4:
+                          for k in (0,2):
+                              emit(start+k*beat,int(beat*1.5),60+_semid(tonic,mode,motif[(b*2+k)%8]),74)
+                      else:
+                          for k in range(8):
+                              if density<.85 and k in (1,5) and b%2==1:continue
+                              degree=motif[(k + (b%4)*2)%8]
+                              if section_index in (3,6) and b%8==7 and k>4:degree+=2
+                              emit(start+k*(beat//2),max(1,int(beat*.43)),60+_semid(tonic,mode,degree),
+                                   86+rng.randrange(22))
+                  elif part=="pad":
+                      for d in (deg,deg+2,deg+4):
+                          emit(start,int(bar*.95),48+_semid(tonic,mode,d),65 if section_index in (0,4,7) else 74)
+                  elif part=="arp":
+                      if section_index not in (0,4,7):
+                          for k in range(8):
+                              if density<.9 and (k%2==1):continue
+                              d=deg + (0,2,4,7,4,2,4,2)[k]
+                              emit(start+k*(beat//2),max(1,int(beat*.32)),60+_semid(tonic,mode,d),65+rng.randrange(25))
+              return out
+          
+          
+          def make_drum_samples():
+              base = Path(os.getenv("LOCALAPPDATA") or (Path.home()/".lemon_composer")) / "Lemon Studio AI" / "Generated Samples"
+              base.mkdir(parents=True, exist_ok=True)
+              sr=44100
+              paths={}
+              for kind,length in (("kick",.50),("snare",.29),("hat",.14)):
+                  path=base/(kind+"-v1.wav")
+                  if path.exists() and path.stat().st_size>1000:
+                      paths[kind]=str(path);continue
+                  rnd=random.Random({"kick":17,"snare":29,"hat":41}[kind]);last=0.0;phase=0.0;samples=[]
+                  n=int(sr*length)
+                  for i in range(n):
+                      t=i/sr;noise=rnd.uniform(-1,1)
+                      if kind=="kick":
+                          hz=49+165*math.exp(-t*35)
+                          phase+=2*math.pi*hz/sr
+                          env=math.exp(-t*8)
+                          click=0.20*noise*math.exp(-t*180)
+                          signal=math.tanh(2.8*(math.sin(phase)*env+click))*.78
+                      elif kind=="snare":
+                          last=0.86*last+0.14*noise
+                          high=noise-last
+                          signal=(high*.79+math.sin(2*math.pi*186*t)*.20)*math.exp(-t*21)*.80
+                      else:
+                          last=0.95*last+0.05*noise
+                          high=noise-last
+                          signal=high*math.exp(-t*40)*.52
+                      samples.append(struct.pack("<h",round(max(-1,min(1,signal))*32767)))
+                  with wave.open(str(path),"wb") as wav:
+                      wav.setnchannels(1);wav.setsampwidth(2);wav.setframerate(sr);wav.writeframes(b"".join(samples))
+                  paths[kind]=str(path)
+              return paths
+          
+          
+          def _apply(rpc, commands, label, steps):
+              if not commands:return []
+              data=rpc.call("apply", commands=commands, name="Lemon Composer : "+label)
+              if not isinstance(data,dict) or not isinstance(data.get("results"),list) or len(data["results"])!=len(commands):
+                  raise RuntimeError("Réponse inattendue du moteur de Lemon Studio")
+              steps.append(label)
+              return data["results"]
+          
+          
+          
+          def composer_channel_roles(state):
+              """Only identify channels explicitly named by this assistant, never arbitrary user tracks."""
+              found={}
+              for ch in state.get('channels',[]):
+                  if not isinstance(ch,dict) or type(ch.get('id')) is not int:
+                      continue
+                  name=ch.get('name')
+                  if not isinstance(name,str):continue
+                  for role,label in ROLE_NAMES.items():
+                      if name.startswith(label+' · '):
+                          found[ch['id']]=role
+                          break
+              return found
+          
+          
+          def rebalance_project(rpc):
+              """Rebalance existing V0.4/V0.5 composer channels in one undoable step.
+              Read-only sample library. Requires explicit confirmation in the UI.
+              """
+              roles=composer_channel_roles(rpc.call('state'))
+              if not roles:
+                  raise ValueError('Aucun canal créé par le compositeur (nom « Kick · ... ») trouvé dans le projet ouvert.')
+              commands=[{'op':'set_main_volume','volume':0.8}]
+              for cid,role in roles.items():
+                  commands.append({'op':'set_channel','channel':cid,
+                                   'volume':_gain_from_db(CHANNEL_ATTENUATION_DB[role],0.78125)})
+              reply=rpc.call('apply',commands=commands,name='Lemon Composer : reequilibrage V0.6')
+              if not isinstance(reply,dict) or len(reply.get('results',[]))!=len(commands):
+                  raise RuntimeError('Reponse du moteur incorrecte apres le reequilibrage : verifier historique avant de continuer')
+              return len(roles)
+          
+          def build_song(rpc, cfg, report, *, rollback=True, chosen_samples=None, pack_only=True):
+              """One accepted user request, many dependent RPC steps; roll back our own steps if a phase fails."""
+              ppq=int(rpc.call("state").get("ppq") or 96)
+              if not 24<=ppq<=1920:
+                  raise RuntimeError("Résolution temporelle du projet non prise en charge")
+              chosen_samples = dict(chosen_samples or {})
+              for role,path in chosen_samples.items():
+                  if role not in ROLE_ORDER or not Path(path).is_file():
+                      raise ValueError("Sample introuvable ou rôle inconnu : " + str(path))
+              if pack_only and not chosen_samples:
+                  raise ValueError("Aucun sample du pack ne convient aux catégories demandées.")
+              report("Utilisation des samples de tes packs...",0)
+              samples=dict(chosen_samples)
+              if not pack_only:
+                  missing_drums = [r for r in PERCUSSIVE if r not in samples]
+                  if missing_drums:
+                      generated=make_drum_samples()
+                      samples.update({r:generated[r] for r in missing_drums})
+              active_parts = [r for r in ROLE_ORDER if (r in samples or not pack_only)]
+              needed=[r for r in active_parts if r not in samples]
+              if needed:
+                  plugins=rpc.call('plugins')
+                  available=set(plugins.get('instruments',[]))
+                  missing={'Citrus' if r in ('lead','pad') else 'Lemon Trio' for r in needed}-available
+                  if missing:
+                      raise RuntimeError('Instrument(s) de secours indisponible(s) : '+', '.join(missing))
+              total=cfg["bars"]
+              segments=modern_section_lengths(total,cfg.get('style'))
+              names=modern_section_labels(cfg)
+              steps=[]
+              try:
+                  report("Création du tempo et des instruments...",3)
+                  init=[{"op":"set_tempo","bpm":cfg["bpm"]},{"op":"set_time_signature","numerator":4,"denominator":4},
+                        {"op":"set_info","title":cfg["title"]}]
+                  for part in active_parts:
+                      data={"op":"add_channel","name":ROLE_NAMES[part]}
+                      if part in samples:
+                          data["sample"]=samples[part]
+                          data["name"]=(ROLE_NAMES[part]+" · "+Path(samples[part]).stem)[:64]
+                      else:
+                          data["plugin"]="Citrus" if part in ("lead","pad") else "Lemon Trio"
+                      init.append(data)
+                  results=_apply(rpc,init,"Instruments et tempo",steps)
+                  ids={role:int(result["channel"]) for role,result in zip(active_parts,results[3:])}
+                  # Attenuate normalized professional samples BEFORE mixing together.
+                  levels=[{'op':'set_main_volume','volume':_gain_from_db(MASTER_ATTENUATION_DB,0.8)}]
+                  levels += [{'op':'set_channel','channel':ids[part],
+                              'volume':_gain_from_db(CHANNEL_ATTENUATION_DB[part],0.78125)}
+                             for part in active_parts]
+                  for k in range(0,len(levels),8):
+                      _apply(rpc,levels[k:k+8],"Protection de niveau audio",steps)
+                  position=0
+                  pat_count=0
+                  nt_count=0
+                  for sec,(name,bars) in enumerate(zip(names,segments)):
+                      report(f"Composition de {name} ({sec+1}/8)...",8+int(sec*10.6))
+                      patterns=[]
+                      for part in active_parts:
+                          notes=section_notes(part,sec,bars,ppq,cfg,ids[part])
+                          if notes and part in samples:
+                              notes=sample_safe_notes(part,notes,samples[part])
+                          if notes:
+                              patterns.append((part,notes))
+                      cmds=[{"op":"add_pattern","name":f"{name} • {ROLE_NAMES[part]}"} for part,_ in patterns]
+                      prs=[]
+                      for k in range(0,len(cmds),8):prs+=_apply(rpc,cmds[k:k+8],f"{name} - patterns",steps)
+                      all_note_cmds=[]
+                      for (part,notes),result in zip(patterns,prs):
+                          patid=int(result["pattern"])
+                          pat_count+=1
+                          # Batches of 48 notes and at most 4 commands per RPC transaction.
+                          for k in range(0,len(notes),48):
+                              all_note_cmds.append({"op":"add_notes","pattern":patid,"notes":notes[k:k+48]})
+                          nt_count+=len(notes)
+                      for k in range(0,len(all_note_cmds),4):
+                          _apply(rpc,all_note_cmds[k:k+4],f"{name} - notes MIDI",steps)
+                      clips=[]
+                      for (part,_),result in zip(patterns,prs):
+                          clips.append({"op":"add_clip","track":active_parts.index(part)+1,
+                                        "position":position,"length":bars*4*ppq,"pattern":int(result["pattern"])})
+                      for k in range(0,len(clips),8):_apply(rpc,clips[k:k+8],f"{name} - playlist",steps)
+                      position+=bars*4*ppq
+                  report("Composition créée ! Sauvegarde ton projet depuis Lemon Studio.",100)
+                  return {"bars":total,"seconds":cfg["seconds"],"patterns":pat_count,"notes":nt_count,"steps":len(steps),"chosen_samples":{r:samples[r] for r in active_parts if r in samples},"missing_roles":[r for r in ROLE_ORDER if r not in active_parts]}
+              except Exception as exc:
+                  if rollback and steps:
+                      report("Erreur détectée : tentative d'annulation des modifications...",0)
+                      errors=[]
+                      for _ in reversed(steps):
+                          try:rpc.call("undo")
+                          except Exception as e:errors.append(str(e));break
+                      if errors:
+                          raise RuntimeError(f"{exc} | Annulation incomplète : {errors[0]}. Vérifie l'historique dans Lemon Studio") from exc
+                  raise
+          
+          
+          
+          
+          def test_style_grooves():
+              """Regression: identical French prompt yields musically different quantized MIDI by genre."""
+              roots = normalize({'title':'Roots','bpm':78,'tonic':'G','scale':'major','style':'frenchcore'},
+                  'Compose un reggae roots en 4/4 à 78 BPM, avec One Drop et skank, 3 minutes')
+              assert roots['style']=='reggae' and roots['bpm']==78, roots
+              assert infer_style('Dub roots, skank syncopé')=='reggae'
+              assert infer_bpm('Crée un reggae instrumental')==78
+              assert infer_style('Frenchcore mélodique')=='frenchcore'
+              for ppq in (96,480):
+                  for sec in range(8):
+                      kick=section_notes('kick',sec,4,ppq,roots,12)
+                      snare=section_notes('snare',sec,4,ppq,roots,13)
+                      assert [n['position'] for n in kick]==[b*4*ppq+2*ppq for b in range(4)]
+                      assert [n['position'] for n in snare]==[n['position'] for n in kick]
+                      hats=section_notes('hat',sec,4,ppq,roots,14)
+                      offbeat_positions={b*4*ppq+k*ppq+ppq//2 for b in range(4) for k in range(4)}
+                      assert offbeat_positions <= {n['position'] for n in hats}
+                      pad=section_notes('pad',sec,4,ppq,roots,15)
+                      assert all((n['position']%ppq)==ppq//2 for n in pad)
+                      organ=section_notes('arp',sec,4,ppq,roots,16)
+                      assert all(n['position']%ppq in (ppq//2, ppq//4) for n in organ)
+                      bass=section_notes('bass',sec,4,ppq,roots,17)
+                      assert all(n['position']%ppq in (0,ppq//2) for n in bass)
+              hard=normalize({'bpm':200}, 'Frenchcore 200 BPM, 1 minute')
+              assert hard['style']=='frenchcore'
+              kicks=section_notes('kick',3,2,96,hard,1)
+              assert {0,96,192,288} <= {n['position'] for n in kicks}
+              assert {0,96,192,288} != {n['position'] for n in section_notes('kick',3,1,96,roots,1)}
+              print('Reggae One Drop / skank / organ bubble / basse syncopée : tests OK')
+          
+          def self_test():
+              test_style_grooves()
+              p=normalize({"title":"Test","progression":[0,5,2,6],"motif":[0,2,4,5,4,2,1,0]},"fais 3 minutes de Frenchcore à 200 BPM")
+              assert p["bpm"]==200 and p["bars"]>=120
+              assert sum(section_lengths(p["bars"]))==p["bars"]
+              assert all(b%4==0 for b in section_lengths(p["bars"]))
+              for sec,bars in enumerate(section_lengths(p["bars"])):
+                  for part in ROLE_ORDER:
+                      ns=section_notes(part,sec,bars,96,p,123)
+                      assert all(n["channel"]==123 and n["length"]>0 and n["position"]>=0 for n in ns)
+              class FakeRpc:
+                  def __init__(self):self.uid=100;self.calls=[]
+                  def call(self,method,**params):
+                      self.calls.append((method,params))
+                      if method=="state":return {"ppq":96}
+                      if method=="plugins":return {"instruments":["Citrus","Lemon Trio"]}
+                      if method=="apply":
+                          res=[]
+                          for item in params["commands"]:
+                              if item["op"] in ("add_channel","add_pattern","add_clip"):
+                                  self.uid+=1
+                                  res.append({{"add_channel":"channel","add_pattern":"pattern","add_clip":"clip"}[item["op"]]:self.uid})
+                              else:res.append(None)
+                          return {"results":res}
+                      if method=="undo":return {"step":"test"}
+                      raise AssertionError(method)
+              fake=FakeRpc();small=normalize({},"fais Frenchcore 200 bpm 30 secondes")
+              out=build_song(fake,small,lambda msg,percent:None, pack_only=False)
+              assert out["patterns"]>=16 and out["notes"]>=100 and out["seconds"]>=25
+              assert len([1 for x,_ in fake.calls if x=="apply"])>8
+              assert not any(c["op"].startswith("delete") for name,kw in fake.calls if name=="apply" for c in kw["commands"])
+              with tempfile.TemporaryDirectory() as tmp:
+                  base=Path(tmp)
+                  a=base/'Pack Frenchcore';b=base/'Pack Leads'
+                  (a/'Kicks').mkdir(parents=True);(a/'Snares').mkdir()
+                  (b/'Melody Leads').mkdir(parents=True)
+                  def tiny_wav(path,dur):
+                      with wave.open(str(path),'wb') as w:
+                          w.setnchannels(1);w.setsampwidth(2);w.setframerate(22050)
+                          w.writeframes(struct.pack('<h',12000)*int(22050*dur))
+                  tiny_wav(a/'Kicks'/'Frenchcore_Kick_01.wav',0.45)
+                  tiny_wav(a/'Snares'/'Hardcore_Snare_02.wav',0.3)
+                  tiny_wav(b/'Melody Leads'/'Dark_Lead_OneShot.wav',1.3)
+                  config=base/'AppData'/'Lemon Studio';config.mkdir(parents=True)
+                  (config/'browser_folders.txt').write_text(str(a)+'\tKicks\n'+str(b)+'\tSynths\n',encoding='utf-8')
+                  roots=discover_pack_roots(base/'AppData')
+                  assert len(roots)==2
+                  ranked,seen=find_pack_candidates(roots,'Frenchcore épique')
+                  chosen=choose_samples_local(ranked)
+                  assert seen==3 and set(chosen)=={'kick','snare','lead'},chosen
+                  assert not any(str(path).endswith('loop.wav') for path in chosen.values())
+                  fake2=FakeRpc()
+                  got=build_song(fake2,small,lambda msg,pct:None,chosen_samples=chosen,pack_only=True)
+                  adds=[c for name,params in fake2.calls if name=='apply' for c in params['commands'] if c['op']=='add_channel']
+                  assert len(adds)==3 and all('sample' in c and 'plugin' not in c for c in adds)
+                  assert set(got['chosen_samples'])=={'kick','snare','lead'} and len(got['missing_roles'])==4
+                  applied=[c for name,params in fake2.calls if name=='apply' for c in params['commands']]
+                  master=[c for c in applied if c['op']=='set_main_volume']
+                  gains=[c for c in applied if c['op']=='set_channel']
+                  assert len(master)==1 and master[0]['volume']==0.8
+                  assert len(gains)==3 and all(0<g['volume']<0.78125 for g in gains)
+                  assert len({g['channel'] for g in gains})==3
+                  chord_notes=[note(1,0,96,60), note(1,0,96,64), note(1,0,96,67),note(1,96,96,72)]
+                  guarded=sample_safe_notes('pad',chord_notes,'Reggae_Chords_01.wav')
+                  assert [x['position'] for x in guarded]==[0,96] and all(x['key']==60 for x in guarded)
+                  high=sample_safe_notes('lead',[note(1,0,96,96),note(1,48,48,100)],'Lead_OneShot.wav')
+                  assert all(48<=x['key']<=72 for x in high)
+              # V0.6: kick is noticeably louder than V0.5 without pushing master above unity.
+              assert MASTER_ATTENUATION_DB == 0.0
+              assert CHANNEL_ATTENUATION_DB['kick'] >= -3 and CHANNEL_ATTENUATION_DB['kick'] <= 0
+              assert modern_section_lengths(128,'frenchcore') != section_lengths(128)
+              assert sum(modern_section_lengths(128,'frenchcore'))==128
+              assert all(n%4==0 for n in modern_section_lengths(128,'reggae'))
+              assert reggae_groove('Reggae roots One Drop',78)=='one_drop'
+              assert reggae_groove('Reggae disco rapide',128)=='reggae_disco'
+              for sec in range(8):
+                  for part in ROLE_ORDER:
+                      notes=section_notes(part,sec,4,96,p,123)
+                      assert all(0<=n['position']<4*4*96 for n in notes)
+              # Musical development: drop A and B cannot be the same copied MIDI sequence.
+              drop_a=section_notes('lead',3,8,96,p,123)
+              drop_b=section_notes('lead',6,8,96,p,123)
+              assert [(n['position'],n['key']) for n in drop_a] != [(n['position'],n['key']) for n in drop_b]
+              build_roll=section_notes('snare',2,8,96,p,123)
+              assert any(n['position'] % 96 in (24,48,72) for n in build_roll)
+              assert not section_notes('kick',4,8,96,p,123)  # genuinely quiet melodic break
+              disco=normalize({},'Reggae disco rapide 128 BPM')
+              assert disco['groove']=='reggae_disco' and disco['bpm']==128
+              assert section_notes('kick',3,1,96,disco,3)[0]['position']==0
+              # One-click correction of a project generated by a previous composer.
+              class RebalanceFake:
+                  def __init__(self):self.cmds=[]
+                  def call(self,method,**params):
+                      if method=='state':return {'channels':[{'id':7,'name':'Kick · Pro Kick.wav'},
+                                                             {'id':8,'name':'Basse · Deep.wav'},
+                                                             {'id':9,'name':'Ma piste originale'}]}
+                      if method=='apply':
+                          self.cmds=params['commands']
+                          return {'results':[None]*len(self.cmds)}
+                      raise AssertionError(method)
+              fake3=RebalanceFake()
+              assert rebalance_project(fake3)==2
+              assert {c['channel'] for c in fake3.cmds if c['op']=='set_channel'}=={7,8}
+              assert fake3.cmds[0]=={'op':'set_main_volume','volume':0.8}
+              print("Lemon Composer V0.6 modern grooves + louder monitoring: self-tests OK",out)
+          
+          if __name__=="__main__":self_test()
+          '@ | Set-Content -LiteralPath lemon_composer_core.py -Encoding utf8
+          @'
+          # -*- coding: utf-8 -*-
+          """Lemon Studio FR — Assistant IA (preview companion).
+          
+          Standalone Windows UI bundled using PyInstaller. Launches Lemon Studio
+          with a locally authenticated control plane. Compose mode requires user approval once.
+          No API key is stored.
+          Uses only Python's standard library (including Tkinter).
+          """
+          from __future__ import annotations
+          
+          import json
+          import os
+          import queue
+          import re
+          import secrets
+          import socket
+          import subprocess
+          import sys
+          import threading
+          import time
+          import unicodedata
+          import urllib.error
+          import urllib.request
+          from pathlib import Path
+          from tkinter import BOTH, END, LEFT, RIGHT, X, Y, BooleanVar, StringVar, Tk, Text, ttk, messagebox
+          from tkinter.scrolledtext import ScrolledText
+          
+          import lemon_composer_core as composer
+          
+          APP_TITLE = "Lemon Studio — Compositeur IA Packs & Modern Mix V0.6"
+          OPTIONS = ("Sans IA (commandes locales)", "ChatGPT (API OpenAI)", "Claude (API Anthropic)", "Ollama (sur ce PC)")
+          DEFAULT_MODELS = {
+              OPTIONS[0]: "",
+              OPTIONS[1]: "gpt-5-mini",
+              OPTIONS[2]: "claude-sonnet-4-6",
+              OPTIONS[3]: "qwen2.5:7b-instruct",
+          }
+          SYSTEM_PROMPT = """Tu es l'assistant d'un logiciel de musique nommé Lemon Studio.
+          Réponds en français uniquement et produis EXACTEMENT un objet JSON, sans markdown :
+          {"message": "Explication honnête et courte de ce que tu proposes", "commands": [{"op":"set_tempo","bpm":200}]}
+          Tu peux proposer au plus 8 commandes. Opérations AUTORISÉES uniquement :
+          set_tempo {bpm: nombre de 10 à 522}
+          set_swing {swing: nombre de 0 à 1}
+          set_time_signature {numerator: entier de 1 à 32, denominator: 2 ou 4 ou 8 ou 16}
+          add_channel {name: nom du canal, facultatif} (canal Sampler muet sans échantillon)
+          add_pattern {name: nom du pattern, facultatif}
+          add_track {} (nouvelle piste de mixeur)
+          set_info {title: titre du projet}
+          add_notes {pattern: ID EXISTANT, notes: [{channel: ID EXISTANT,position: ticks >= 0,length: ticks > 0,key: 0..127,velocity: 1..128,pan: 0..128}]}.
+          Utilise exclusivement des ID présents dans l'état du projet fourni. Ne fabrique jamais d'ID.
+          N'utilise JAMAIS de commandes dangereuses, suppression, sauvegarde, ajout d'effets, accès disque ni outil réseau.
+          Si un instrument ou pattern doit être créé avant de recevoir des notes, propose d'abord de l'ajouter, puis demande une seconde requête pour ajouter les notes après validation par l'utilisateur.
+          N'affirme pas générer de son ni choisir un sample quand tu n'as créé que des pistes/patterns vides.
+          Si la demande est impossible avec les opérations autorisées, réponds avec commands = [] et explique clairement la limite.
+          L'utilisateur devra confirmer toute proposition dans Lemon Studio; tu ne peux jamais l'appliquer directement.
+          """
+          
+          
+          def clean(text: str) -> str:
+              return "".join(c for c in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(c))
+          
+          
+          def offline_plan(text: str) -> dict:
+              """Small deterministic command subset, no AI or Internet required."""
+              t = clean(text)
+              commands: list[dict] = []
+              bpm = re.search(r"\b(\d{2,3})\s*bpm\b", t)
+              if not bpm:
+                  bpm = re.search(r"\b(?:tempo|bpm)\s*(?:a|de|sur|=|:)?\s*(\d{2,3})\b", t)
+              if bpm:
+                  value = int(bpm.group(1))
+                  if not 10 <= value <= 522:
+                      raise ValueError("Le tempo doit être compris entre 10 et 522 BPM.")
+                  commands.append({"op": "set_tempo", "bpm": value})
+          
+              if re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?(?:piste\s+(?:de\s+)?mixeur|piste\s+mixer|insert\s+mixeur)\b", t):
+                  commands.append({"op": "add_track"})
+          
+              pattern_match = re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?(?:pattern|motif)\s*(?:nomme|appele|:)?\s*([\w -]{0,42})", t)
+              if pattern_match:
+                  name = pattern_match.group(1).strip(" .,-")
+                  commands.append({"op": "add_pattern", **({"name": name.title()} if name else {})})
+          
+              chan = re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?(?:canal|channel|instrument)\s*(?:nomme|appele|:)?\s*([\w -]{0,42})", t)
+              if chan:
+                  name = chan.group(1).strip(" .,-")
+                  commands.append({"op": "add_channel", **({"name": name.title()} if name else {})})
+              elif re.search(r"\b(?:ajout\w*|cre\w*)\s+(?:une?\s+)?kick\b", t):
+                  commands.append({"op": "add_channel", "name": "Kick"})
+          
+              title = re.search(r"\b(?:nomme|renomme|appelle)\s+(?:le\s+)?projet\s+(.{1,64})", text, re.IGNORECASE)
+              if title:
+                  commands.append({"op": "set_info", "title": title.group(1).strip(" \"'.,")})
+          
+              if not commands:
+                  return {"message": "Mode local : je comprends actuellement le BPM, l'ajout de canaux, de pistes du mixeur, de patterns et le nom du projet. Pour créer des notes ou des arrangements à partir d'une description libre, choisis ChatGPT, Claude ou Ollama.", "commands": []}
+              return {"message": "Voici les modifications que je peux proposer sans connexion IA. Un nouveau canal Sampler ne produit pas de son tant que tu ne charges pas de sample.", "commands": commands[:8]}
+          
+          
+          def parse_json_answer(raw: str) -> dict:
+              if not isinstance(raw, str):
+                  raise ValueError("L'IA n'a pas retourné de texte.")
+              stripped = raw.strip()
+              start = stripped.find("{")
+              if start < 0:
+                  raise ValueError("La réponse de l'IA ne contient pas de JSON exploitable.")
+              try:
+                  obj, _ = json.JSONDecoder().raw_decode(stripped[start:])
+              except json.JSONDecodeError as e:
+                  raise ValueError("La réponse de l'IA n'est pas un JSON valide.") from e
+              if not isinstance(obj, dict):
+                  raise ValueError("Réponse IA incorrecte : objet attendu.")
+              return obj
+          
+          
+          def _short_str(x, limit=80):
+              if not isinstance(x, str) or not x.strip() or len(x) > limit or "\x00" in x or "\n" in x:
+                  raise ValueError("Nom ou valeur de texte invalide.")
+              return x.strip()
+          
+          
+          def _int(x, mini, maxi):
+              if type(x) is not int or not mini <= x <= maxi:
+                  raise ValueError(f"Entier requis entre {mini} et {maxi}.")
+              return x
+          
+          
+          def _float(x, mini, maxi):
+              if isinstance(x, bool) or not isinstance(x, (int, float)) or not mini <= float(x) <= maxi:
+                  raise ValueError(f"Nombre requis entre {mini} et {maxi}.")
+              return float(x)
+          
+          
+          def validate_commands(plan: dict, state: dict) -> tuple[str, list[dict]]:
+              """Hard allowlist. Never pass arbitrary model-generated operations to Lemon Studio."""
+              msg = str(plan.get("message", "Proposition de modifications."))[:1200]
+              items = plan.get("commands", [])
+              if not isinstance(items, list) or len(items) > 8:
+                  raise ValueError("L'assistant doit proposer au maximum huit commandes.")
+              channel_ids = {int(c["id"]) for c in state.get("channels", []) if isinstance(c, dict) and type(c.get("id")) is int}
+              pattern_ids = {int(p["id"]) for p in state.get("patterns", []) if isinstance(p, dict) and type(p.get("id")) is int}
+              ppq = int(state.get("ppq") or 96)
+              result = []
+              for item in items:
+                  if not isinstance(item, dict):
+                      raise ValueError("Commande non valide.")
+                  op = item.get("op")
+                  if op == "set_tempo" and set(item) == {"op", "bpm"}:
+                      result.append({"op": op, "bpm": _float(item["bpm"], 10, 522)})
+                  elif op == "set_swing" and set(item) == {"op", "swing"}:
+                      result.append({"op": op, "swing": _float(item["swing"], 0, 1)})
+                  elif op == "set_time_signature" and set(item) == {"op", "numerator", "denominator"}:
+                      num = _int(item["numerator"], 1, 32)
+                      den = _int(item["denominator"], 2, 16)
+                      if den not in (2, 4, 8, 16):
+                          raise ValueError("Dénominateur invalide.")
+                      result.append({"op": op, "numerator": num, "denominator": den})
+                  elif op in ("add_channel", "add_pattern") and set(item) <= {"op", "name"}:
+                      result.append({"op": op, **({"name": _short_str(item["name"], 64)} if "name" in item else {})})
+                  elif op == "add_track" and set(item) == {"op"}:
+                      result.append({"op": op})
+                  elif op == "set_info" and set(item) == {"op", "title"}:
+                      result.append({"op": op, "title": _short_str(item["title"], 110)})
+                  elif op == "add_notes" and set(item) == {"op", "pattern", "notes"}:
+                      pid = _int(item["pattern"], 1, 2**32 - 1)
+                      if pid not in pattern_ids:
+                          raise ValueError("Le pattern indiqué par l'IA n'existe pas encore.")
+                      notes = item["notes"]
+                      if not isinstance(notes, list) or not 1 <= len(notes) <= 64:
+                          raise ValueError("Ajoute entre 1 et 64 notes par commande.")
+                      clean_notes = []
+                      for note in notes:
+                          if not isinstance(note, dict) or set(note) - {"channel", "position", "length", "key", "velocity", "pan"}:
+                              raise ValueError("Champs de note invalides.")
+                          if not {"channel", "position", "length", "key"} <= set(note):
+                              raise ValueError("La note doit indiquer channel, position, length et key.")
+                          cid = _int(note["channel"], 1, 2**32 - 1)
+                          if cid not in channel_ids:
+                              raise ValueError("Le canal indiqué par l'IA n'existe pas encore.")
+                          n = {"channel": cid, "position": _int(note["position"], 0, ppq * 256),
+                               "length": _int(note["length"], 1, ppq * 16), "key": _int(note["key"], 0, 127),
+                               "velocity": _int(note.get("velocity", 100), 1, 128), "pan": _int(note.get("pan", 64), 0, 128)}
+                          clean_notes.append(n)
+                      result.append({"op": op, "pattern": pid, "notes": clean_notes})
+                  else:
+                      raise ValueError(f"Commande non autorisée ou paramètres invalides : {op!r}.")
+              return msg, result
+          
+          
+          def project_summary(state: dict) -> dict:
+              return {"tempo": state.get("tempo"), "ppq": state.get("ppq"),
+                      "channels": [{"id": c.get("id"), "name": c.get("name"), "kind": c.get("kind")} for c in state.get("channels", [])[:20]],
+                      "patterns": [{"id": p.get("id"), "name": p.get("name"), "notes": p.get("notes")} for p in state.get("patterns", [])[:20]],
+                      "mixer": [{"id": m.get("id"), "name": m.get("name")} for m in state.get("mixer", [])[:15]]}
+          
+          
+          def api_post(url: str, headers: dict, payload: dict) -> dict:
+              req = urllib.request.Request(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                           headers={"Content-Type": "application/json", **headers}, method="POST")
+              try:
+                  with urllib.request.urlopen(req, timeout=55) as response:
+                      return json.loads(response.read(2_000_000).decode("utf-8"))
+              except urllib.error.HTTPError as e:
+                  msg = e.read(2048).decode("utf-8", "replace")
+                  raise RuntimeError(f"Erreur API HTTP {e.code} : {msg[:500]}") from None
+              except urllib.error.URLError as e:
+                  raise RuntimeError(f"Connexion au fournisseur IA impossible : {e.reason}") from None
+          
+          
+          def online_plan(text: str, state: dict, provider: str, model: str, api_key: str) -> dict:
+              payload = json.dumps({"demande": text[:1500], "etat_du_projet": project_summary(state)}, ensure_ascii=False)
+              model = _short_str(model, 120)
+              if provider == OPTIONS[1]:
+                  if not api_key.strip():
+                      raise ValueError("Saisis ta clé API OpenAI (ton abonnement ChatGPT ne suffit pas).")
+                  response = api_post("https://api.openai.com/v1/responses", {"Authorization": "Bearer " + api_key.strip()},
+                                      {"model": model, "instructions": SYSTEM_PROMPT, "input": payload, "max_output_tokens": 1500})
+                  output_text = response.get("output_text", "")
+                  if not output_text:
+                      output_text = "\n".join(content.get("text", "") for out in response.get("output", [])
+                                              for content in out.get("content", []) if content.get("type") == "output_text")
+                  return parse_json_answer(output_text)
+              if provider == OPTIONS[2]:
+                  if not api_key.strip():
+                      raise ValueError("Saisis ta clé API Anthropic (ton abonnement Claude ne suffit pas).")
+                  response = api_post("https://api.anthropic.com/v1/messages",
+                                      {"x-api-key": api_key.strip(), "anthropic-version": "2023-06-01"},
+                                      {"model": model, "max_tokens": 1500, "system": SYSTEM_PROMPT,
+                                       "messages": [{"role": "user", "content": payload}]})
+                  output_text = "\n".join(c.get("text", "") for c in response.get("content", []) if c.get("type") == "text")
+                  return parse_json_answer(output_text)
+              if provider == OPTIONS[3]:
+                  response = api_post("http://127.0.0.1:11434/api/generate", {},
+                                      {"model": model, "prompt": SYSTEM_PROMPT + "\n" + payload, "stream": False})
+                  return parse_json_answer(response.get("response", ""))
+              return offline_plan(text)
+          
+          
+          class LemonRpc:
+              def __init__(self, port: int, token: str):
+                  self.port = port
+                  self.token = token
+          
+              def call(self, method: str, **params):
+                  # Per-request connections are intentional: no shared socket across Tk workers.
+                  with socket.create_connection(("127.0.0.1", self.port), timeout=6) as conn:
+                      conn.settimeout(12)
+                      f = conn.makefile("r", encoding="utf-8")
+                      def send(name, data):
+                          data = json.dumps({"jsonrpc": "2.0", "id": 1 if name == "hello" else 2,
+                                             "method": name, "params": data}, ensure_ascii=False) + "\n"
+                          conn.sendall(data.encode("utf-8"))
+                          line = f.readline()
+                          if not line:
+                              raise ConnectionError("Lemon Studio a fermé la connexion.")
+                          out = json.loads(line)
+                          if "error" in out:
+                              raise RuntimeError("Lemon Studio : " + out["error"].get("message", "Erreur inconnue"))
+                          return out.get("result")
+                      send("hello", {"name": "Assistant IA FR", "token": self.token})
+                      return send(method, params)
+          
+          
+          def local_port() -> int:
+              with socket.socket() as s:
+                  s.bind(("127.0.0.1", 0))
+                  return s.getsockname()[1]
+          
+          
+          class AssistantApp:
+              def __init__(self):
+                  self.root = Tk()
+                  self.root.title(APP_TITLE)
+                  self.root.geometry("750x835")
+                  self.root.minsize(535, 600)
+                  self.root.configure(bg="#111721")
+                  self.events = queue.Queue()
+                  self.pending = False
+                  self.proc = None
+                  self.rpc = None
+                  self.mode = StringVar(value=OPTIONS[3])
+                  self.model = StringVar(value="")
+                  self.api_key = StringVar(value="")
+                  self.allow_online = BooleanVar(value=False)
+                  self.pack_only = BooleanVar(value=True)
+                  self.status = StringVar(value="Démarrage de Lemon Studio...")
+                  self._paint()
+                  self.root.after(100, self._drain)
+                  self.root.protocol("WM_DELETE_WINDOW", self._close)
+                  threading.Thread(target=self._launch, daemon=True).start()
+          
+              def _paint(self):
+                  bg, panel, ink, muted, accent = "#111721", "#1b2533", "#edf1f7", "#a4afbf", "#f2bd55"
+                  style = ttk.Style(self.root)
+                  style.theme_use("clam")
+                  style.configure("AI.TCombobox", fieldbackground=panel, background=panel, foreground="#111721", padding=6)
+                  head = ttk.Frame(self.root)
+                  head.pack(fill=X, padx=18, pady=(20, 7))
+                  head.configure(style="AI.Head.TFrame")
+                  style.configure("AI.Head.TFrame", background=bg)
+                  ttk.Label(head, text="🍋  LEMON STUDIO  ·  ASSISTANT IA", foreground=accent,
+                            background=bg, font=("Segoe UI", 16, "bold")).pack(anchor="w")
+                  ttk.Label(head, text="Fenêtre de contrôle séparée · changements confirmés dans Lemon Studio",
+                            foreground=muted, background=bg, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
+          
+                  settings = ttk.Frame(self.root, style="AI.Head.TFrame")
+                  settings.pack(fill=X, padx=18, pady=(8, 8))
+                  ttk.Label(settings, text="Fournisseur IA", foreground=ink, background=bg).grid(row=0, column=0, sticky="w")
+                  self.combo = ttk.Combobox(settings, state="readonly", values=OPTIONS, textvariable=self.mode, width=28)
+                  self.combo.grid(row=1, column=0, sticky="ew", padx=(0, 8), pady=(3, 7))
+                  self.combo.bind("<<ComboboxSelected>>", self._mode_changed)
+                  ttk.Label(settings, text="Modèle", foreground=ink, background=bg).grid(row=0, column=1, sticky="w")
+                  self.model_entry = ttk.Entry(settings, textvariable=self.model, width=23)
+                  self.model_entry.grid(row=1, column=1, sticky="ew", pady=(3, 7))
+                  settings.columnconfigure(0, weight=1)
+                  settings.columnconfigure(1, weight=1)
+                  ttk.Label(settings, text="Clé API (non enregistrée, inutile en mode local / Ollama)",
+                            foreground=muted, background=bg).grid(row=2, column=0, columnspan=2, sticky="w")
+                  self.key_entry = ttk.Entry(settings, textvariable=self.api_key, show="●")
+                  self.key_entry.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(3, 2))
+                  self.privacy = ttk.Checkbutton(settings,
+                      text="J'autorise l'envoi d'un résumé de mon projet à l'API IA choisie",
+                      variable=self.allow_online)
+                  self.privacy.grid(row=4, column=0, columnspan=2, sticky="w", pady=(5, 3))
+                  ttk.Label(settings, text="Les API en ligne sont payantes séparément. Aucune clé n'est sauvegardée.",
+                            foreground=muted, background=bg).grid(row=5, column=0, columnspan=2, sticky="w")
+                  self._mode_changed()
+          
+                  pack_settings = ttk.Frame(self.root, style="AI.Head.TFrame")
+                  pack_settings.pack(fill=X, padx=18, pady=(0, 7))
+                  ttk.Label(pack_settings, text="Packs de samples : recherche automatique dans les dossiers de Lemon Studio",
+                            foreground=accent, background=bg).pack(anchor="w")
+                  ttk.Checkbutton(pack_settings, text="Utiliser uniquement mes packs (ne pas générer de sons génériques)",
+                                  variable=self.pack_only).pack(anchor="w", pady=(2, 0))
+          
+                  self.chat = ScrolledText(self.root, height=16, wrap="word", bg="#141c28", fg=ink,
+                                           insertbackground=ink, relief="flat", padx=13, pady=12, font=("Segoe UI", 10), state="disabled")
+                  self.chat.pack(fill=BOTH, expand=True, padx=18, pady=(7, 12))
+                  self.chat.tag_configure("user", foreground="#f2bd55", spacing1=5, spacing3=5)
+                  self.chat.tag_configure("assistant", foreground=ink, spacing1=5, spacing3=9)
+                  self.chat.tag_configure("system", foreground="#b2c8e2", spacing1=5, spacing3=10)
+                  self._chat("system", "V0.6 — Mix moins faible : master à son niveau unity, canaux mieux équilibrés, sans changer les samples. Arrangements Frenchcore avec hooks, breaks et drops A/B distincts ; reggae roots One Drop ou reggae-disco selon le prompt. Pour un projet V0.5 déjà ouvert, clique sur « Rééquilibrer volume du projet ». Le résultat est toujours une MAQUETTE, pas un master garanti sans clipping.\n\nLe bouton « Proposer » conserve les anciennes commandes.\n")
+          
+                  ttk.Label(self.root, text="Ton instruction", background=bg, foreground=ink,
+                            font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=18)
+                  self.prompt = Text(self.root, height=3, bg=panel, fg=ink, insertbackground=ink,
+                                     relief="flat", padx=10, pady=8, wrap="word", font=("Segoe UI", 10))
+                  self.prompt.pack(fill=X, padx=18, pady=(5, 10))
+                  self.prompt.bind("<Control-Return>", lambda _: self._submit())
+                  self.prompt.bind("<Control-Shift-Return>", lambda _: self._compose())
+                  bottom = ttk.Frame(self.root, style="AI.Head.TFrame")
+                  bottom.pack(fill=X, padx=18, pady=(0, 5))
+                  self.submit = ttk.Button(bottom, text="Proposer (Ctrl+Entrée)", command=self._submit)
+                  self.submit.pack(side=LEFT, padx=(0, 7))
+                  self.compose_button = ttk.Button(bottom, text="Composer un morceau (1 prompt)", command=self._compose)
+                  self.compose_button.pack(side=LEFT)
+                  ttk.Button(bottom, text="Actualiser l'état", command=self._refresh_state).pack(side=RIGHT)
+                  fixbar=ttk.Frame(self.root, style="AI.Head.TFrame")
+                  fixbar.pack(fill=X, padx=18, pady=(0,5))
+                  self.rebalance_button=ttk.Button(fixbar, text="Rééquilibrer volume du projet V0.5", command=self._rebalance)
+                  self.rebalance_button.pack(side=LEFT)
+                  ttk.Label(fixbar, text="Sur les canaux créés par le compositeur uniquement", foreground=muted,
+                            background=bg, font=("Segoe UI", 9)).pack(side=LEFT, padx=(12,0))
+                  ttk.Label(self.root, textvariable=self.status, background=bg, foreground=muted,
+                            font=("Segoe UI", 9)).pack(anchor="w", padx=18, pady=(4, 13))
+          
+              def _mode_changed(self, _event=None):
+                  provider = self.mode.get()
+                  if _event is not None:
+                      self.api_key.set("")
+                      self.allow_online.set(False)
+                  self.model.set(DEFAULT_MODELS.get(provider, ""))
+                  self.model_entry.configure(state="normal" if provider != OPTIONS[0] else "disabled")
+                  self.key_entry.configure(state="normal" if provider in OPTIONS[1:3] else "disabled")
+                  self.privacy.configure(state="normal" if provider in OPTIONS[1:3] else "disabled")
+          
+              def _chat(self, tag, msg):
+                  self.chat.configure(state="normal")
+                  self.chat.insert(END, ("Vous : " if tag == "user" else "Assistant : " if tag == "assistant" else "ℹ ") + msg + "\n", tag)
+                  self.chat.configure(state="disabled")
+                  self.chat.see(END)
+          
+              def _notify(self, kind, payload):
+                  self.events.put((kind, payload))
+          
+              def _drain(self):
+                  try:
+                      while True:
+                          kind, payload = self.events.get_nowait()
+                          if kind == "status":
+                              self.status.set(payload)
+                          elif kind == "chat":
+                              self._chat("assistant", payload)
+                          elif kind == "connected":
+                              self.rpc = payload
+                              self.status.set("Connecté · commandes simples avec confirmation / composition après accord")
+                              self._chat("system", "Lemon Studio est connecté. Les commandes individuelles restent soumises à confirmation. Le mode Composition demandera ton accord une seule fois avant de créer le projet.")
+                          elif kind == "composer_plan":
+                              prompt, cfg, chosen, scanned, roots, choice_note, pack_only = payload
+                              self._confirm_compose(prompt, cfg, chosen, scanned, roots, choice_note, pack_only)
+                          elif kind == "composer_progress":
+                              msg, pct = payload
+                              self.status.set(f"Composition : {pct}% — {msg}")
+                              self._chat("system", msg)
+                          elif kind == "ready":
+                              self.pending = False
+                              self.submit.configure(state="normal")
+                              self.compose_button.configure(state="normal")
+                              self.rebalance_button.configure(state="normal")
+                  except queue.Empty:
+                      pass
+                  self.root.after(100, self._drain)
+          
+              def _launch(self):
+                  try:
+                      if getattr(sys, "frozen", False):
+                          root = Path(sys.executable).resolve().parent
+                      else:
+                          root = Path(__file__).resolve().parent
+                      exe = root / "lemonstudio.exe"
+                      if not exe.is_file():
+                          raise FileNotFoundError(f"Impossible de trouver lemonstudio.exe dans {root}. Décompresse intégralement l'archive ZIP.")
+                      port, token = local_port(), secrets.token_urlsafe(32)
+                      self.proc = subprocess.Popen([str(exe), "--control", str(port), "--control-level", "edit",
+                                                    "--control-token", token], cwd=str(root))
+                      rpc = LemonRpc(port, token)
+                      for _ in range(180):
+                          if self.proc.poll() is not None:
+                              raise RuntimeError("Lemon Studio s'est fermé pendant le démarrage.")
+                          try:
+                              rpc.call("state")
+                              self._notify("connected", rpc)
+                              return
+                          except (OSError, TimeoutError, ConnectionError):
+                              time.sleep(0.25)
+                      raise RuntimeError("Lemon Studio n'a pas ouvert son interface de contrôle. Réessaie en fermant les anciennes fenêtres.")
+                  except Exception as exc:
+                      self._notify("status", "Échec de connexion")
+                      self._notify("chat", str(exc))
+          
+              def _busy_start(self):
+                  if self.pending:
+                      return False
+                  if not self.rpc:
+                      self._chat("system", "Lemon Studio n'est pas encore connecté.")
+                      return False
+                  self.pending = True
+                  self.submit.configure(state="disabled")
+                  self.compose_button.configure(state="disabled")
+                  self.rebalance_button.configure(state="disabled")
+                  return True
+          
+              def _submit(self):
+                  value = self.prompt.get("1.0", END).strip()
+                  if not value or not self._busy_start():
+                      return
+                  provider, model, key = self.mode.get(), self.model.get(), self.api_key.get()
+                  if provider in OPTIONS[1:3] and not self.allow_online.get():
+                      self.pending = False
+                      self.submit.configure(state="normal")
+                      self.compose_button.configure(state="normal")
+                      self.rebalance_button.configure(state="normal")
+                      self._chat("system", "Coche la case de consentement avant d'envoyer le résumé du projet à une API externe.")
+                      return
+                  self.prompt.delete("1.0", END)
+                  self._chat("user", value)
+                  self.status.set("Analyse de la demande...")
+                  def work():
+                      try:
+                          state = self.rpc.call("state")
+                          p = offline_plan(value) if provider == OPTIONS[0] else online_plan(value, state, provider, model, key)
+                          msg, cmds = validate_commands(p, state)
+                          self._notify("chat", msg)
+                          if cmds:
+                              self._notify("chat", "Proposition :\n" + "\n".join(" • " + json.dumps(c, ensure_ascii=False)[:350] for c in cmds))
+                              result = self.rpc.call("propose", commands=cmds, name="Assistant IA : " + value[:48])
+                              self._notify("chat", f"Proposition n° {result.get('proposal')} transmise. Confirme ou refuse les changements dans Lemon Studio.")
+                          else:
+                              self._notify("chat", "Aucune modification proposée.")
+                          self._notify("status", "Prêt · aucun changement sans confirmation")
+                      except Exception as exc:
+                          self._notify("chat", "Impossible de proposer ces changements : " + str(exc))
+                          self._notify("status", "Erreur · tu peux réessayer")
+                      finally:
+                          self._notify("ready", None)
+                  threading.Thread(target=work, daemon=True).start()
+          
+              def _compose(self):
+                  value = self.prompt.get("1.0", END).strip()
+                  if not value or not self._busy_start():
+                      return
+                  if self.mode.get() != OPTIONS[3]:
+                      self._chat("system", "Pour composer un morceau complet gratuitement, sélectionne Ollama (sur ce PC).")
+                      self._notify("ready", None)
+                      return
+                  model = self.model.get().strip()
+                  pack_only = self.pack_only.get()
+                  self._chat("user", value)
+                  self.status.set("Analyse de tes packs + préparation musicale Ollama...")
+                  def plan_worker():
+                      try:
+                          roots=composer.discover_pack_roots()
+                          if not roots:
+                              raise ValueError("Aucun dossier de samples enregistré dans Lemon Studio. Ajoute tes packs au Browser de Lemon Studio puis redémarre l'assistant.")
+                          self._notify("chat", f"Recherche dans {len(roots)} dossier(s) de samples enregistrés...")
+                          ranked,scanned=composer.find_pack_candidates(roots,value)
+                          if not any(ranked.values()):
+                              raise ValueError("Des fichiers sont présents mais aucun sample compatible n'a pu être identifié. Vérifie les sous-dossiers et les noms des fichiers (Kick, Snare, Lead...).")
+                          current = self.rpc.call("state")
+                          raw = composer.plan_from_ollama(value, model, current)
+                          cfg = composer.normalize(raw, value)
+                          chosen,choice_note=composer.choose_samples_ollama(ranked,value,model)
+                          self._notify("composer_plan", (value,cfg,chosen,scanned,len(roots),choice_note,pack_only))
+                      except Exception as exc:
+                          self._notify("chat", "Impossible de préparer le morceau : " + str(exc))
+                          self._notify("status", "Erreur Ollama · vérifie le modèle installé")
+                          self._notify("ready", None)
+                  threading.Thread(target=plan_worker, daemon=True).start()
+          
+              def _confirm_compose(self, prompt, cfg, chosen, scanned, roots, choice_note, pack_only):
+                  missing=[r for r in composer.ROLE_ORDER if r not in chosen]
+                  names="\n".join(f"- {composer.ROLE_NAMES[role]} : {Path(path).name}" for role,path in chosen.items())
+                  self._chat("system", f"Analyse de {scanned} samples dans {roots} pack(s) · {choice_note}.\n" + names)
+                  text = (f"Genre / rythme : {cfg.get('style', 'generic')}\n"
+                          f"Titre : {cfg['title']}\n" 
+                          f"Tempo : {cfg['bpm']} BPM\n"
+                          f"Durée cible : ~{cfg['seconds']} secondes ({cfg['bars']} mesures)\n\n"
+                          f"{scanned} fichiers explorés dans {roots} dossier(s).\n"
+                          f"Sélection : {choice_note}\n\n{names}\n\n"
+                          + ("Rôles non identifiés, omis (mode packs uniquement) : " +
+                              ", ".join(composer.ROLE_NAMES[r] for r in missing) + "\n\n" if pack_only and missing else "")
+                          + (("Reggae roots : One Drop strict, skank, orgue bubble. " if cfg.get('groove')=='one_drop' else
+                              "Reggae disco : backbeat dansant, basse syncopee, skank en contretemps. ")
+                             if cfg.get('style') == 'reggae' else
+                             "Arrangement modernisé : intro hook, montées, drops contrastés et break. ")
+                          + ("Mix V0.6 : master à son niveau unity, gains des canaux moins abaissés, "
+                             "transpositions MIDI limitées et accords samples moins superposés. "
+                             "Ceci ne remplace pas un limiteur ni un vrai mastering ; surveille le vumètre.\n\n"
+                             "Attention : les sons des packs sont chargés tels quels. Un lead ou une basse peut être mal accordé ; "
+                             "la sélection repose sur les noms et les métadonnées, pas une écoute IA complète.\n\n"
+                             "Les fichiers du pack resteront intacts. Les modifications du projet sont annulables. "
+                             "Le projet n'est pas enregistré automatiquement.\n\n"
+                             "Autoriser la création du morceau ?"))
+                  if not messagebox.askyesno("Autoriser la composition automatique", text, parent=self.root):
+                      self._chat("system", "Composition annulée. Aucun changement effectué.")
+                      self._notify("ready", None)
+                      return
+                  self.prompt.delete("1.0", END)
+                  self._chat("assistant", f"Composition acceptée : {cfg['title']}, {cfg['bpm']} BPM, {cfg['bars']} mesures. Création automatique en cours...")
+                  def work():
+                      try:
+                          result = composer.build_song(self.rpc, cfg,
+                                    lambda msg,pct: self._notify("composer_progress",(msg,pct)),
+                                    chosen_samples=chosen,pack_only=pack_only)
+                          used=" ; ".join(composer.ROLE_NAMES[r] + " : " + Path(p).name for r,p in result['chosen_samples'].items())
+                          self._notify("chat", f"Morceau créé : {result['patterns']} patterns, {result['notes']} notes, "
+                                               f"{result['bars']} mesures. Samples : {used}. "
+                                               "Ouvre la Playlist et enregistre une COPIE du projet.")
+                          self._notify("status", "Composition terminée · projet non sauvegardé")
+                      except Exception as exc:
+                          self._notify("chat", "La composition a échoué : " + str(exc))
+                          self._notify("status", "Échec de composition · consulte le journal")
+                      finally:
+                          self._notify("ready", None)
+                  threading.Thread(target=work, daemon=True).start()
+          
+              def _rebalance(self):
+                  if not self._busy_start():
+                      return
+                  try:
+                      detected=composer.composer_channel_roles(self.rpc.call('state'))
+                      if not detected:
+                          raise ValueError("Aucun canal de l'ancien compositeur trouvé dans le projet ouvert.")
+                      yes=messagebox.askyesno('Rééquilibrer volume — V0.6',
+                          f"{len(detected)} canal(aux) de l'assistant détectés.\n"
+                          'Le volume master sera remis au niveau normal (unity), et les volumes de ces canaux seront rééquilibrés.\n\n'
+                          'Cela peut devenir plus fort : commence à faible volume de tes enceintes / casque et vérifie le vumètre.\n\n'
+                          'Les autres pistes et les samples ne seront pas modifiés. Action annulable. Continuer ?',parent=self.root)
+                      if not yes:
+                          self._chat('system','Rééquilibrage annulé, aucune modification.')
+                          self._notify('ready',None)
+                          return
+                  except Exception as exc:
+                      self._chat('system',str(exc))
+                      self._notify('ready',None)
+                      return
+                  def worker():
+                      try:
+                          count=composer.rebalance_project(self.rpc)
+                          self._notify('chat',f'{count} canaux rééquilibrés. Teste à faible volume, surveille le master et sauvegarde une COPIE du projet.')
+                          self._notify('status','Rééquilibrage terminé · projet non sauvegardé')
+                      except Exception as exc:
+                          self._notify('chat','Rééquilibrage impossible : '+str(exc))
+                      finally:
+                          self._notify('ready',None)
+                  threading.Thread(target=worker,daemon=True).start()
+          
+              def _refresh_state(self):
+                  if not self._busy_start():
+                      return
+                  def work():
+                      try:
+                          s = self.rpc.call("state")
+                          self._notify("chat", f"Projet actuel : {s.get('tempo')} BPM · {len(s.get('channels',[]))} canaux · {len(s.get('patterns',[]))} patterns.")
+                      except Exception as exc:
+                          self._notify("chat", "Impossible de lire le projet : " + str(exc))
+                      finally:
+                          self._notify("ready", None)
+                  threading.Thread(target=work, daemon=True).start()
+          
+              def _close(self):
+                  # We deliberately do not terminate Lemon Studio: closing the AI shouldn't lose DAW work.
+                  self.root.destroy()
+          
+              def run(self):
+                  self.root.mainloop()
+          
+          
+          def run_self_tests():
+              sample = {"ppq": 96, "channels": [{"id": 7, "name": "Sampler"}], "patterns": [{"id": 21, "name": "Intro"}]}
+              assert offline_plan("Mets le tempo à 200 BPM")["commands"] == [{"op": "set_tempo", "bpm": 200}]
+              assert offline_plan("ajoute un canal Kick")["commands"][0]["op"] == "add_channel"
+              assert offline_plan("crée un pattern Intro")["commands"][0]["op"] == "add_pattern"
+              assert validate_commands({"commands": [{"op": "add_notes", "pattern": 21, "notes": [{"channel": 7, "position": 0, "length": 96, "key": 60}]}]}, sample)[1][0]["notes"][0]["velocity"] == 100
+              for malicious in [{"op": "delete_channel", "channel": 7}, {"op": "add_notes", "pattern": 22, "notes": [{"channel": 7, "position": 0, "length": 96, "key": 60}]}]:
+                  try:
+                      validate_commands({"commands": [malicious]}, sample)
+                      raise AssertionError("Unsafe command accepted")
+                  except ValueError:
+                      pass
+              assert parse_json_answer('```json\n{"message":"ok","commands":[]}\n```')["message"] == "ok"
+              composer.self_test()
+              print("Lemon Studio AI Composer V0.6: self-tests OK")
+          
+          
+          if __name__ == "__main__":
+              if "--self-test" in sys.argv:
+                  run_self_tests()
+              else:
+                  AssistantApp().run()
+          '@ | Set-Content -LiteralPath lemon_ai_composer.py -Encoding utf8
+          python -m py_compile lemon_composer_core.py lemon_ai_composer.py
+          if ($LASTEXITCODE -ne 0) { throw 'Erreur de syntaxe Python' }
+          python lemon_ai_composer.py --self-test
+          if ($LASTEXITCODE -ne 0) { throw 'Echec des tests du compositeur IA' }
+      - name: Compiler le programme Windows
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check "pyinstaller>=6.10,<7"
+          if ($LASTEXITCODE -ne 0) { throw 'Installation PyInstaller echouee' }
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name Lemon-Studio-Compositeur-Modern-IA lemon_ai_composer.py
+          if ($LASTEXITCODE -ne 0) { throw 'Compilation PyInstaller echouee' }
+          if (-not (Test-Path 'dist\Lemon-Studio-Compositeur-Modern-IA.exe')) { throw 'Executable IA introuvable' }
+          if (-not (Test-Path 'Lemon-Studio-FR-Modern\lemonstudio.exe')) { throw 'Lemon Studio FR introuvable' }
+          Copy-Item 'dist\Lemon-Studio-Compositeur-Modern-IA.exe' 'Lemon-Studio-FR-Modern\Lemon-Studio-Compositeur-Modern-IA.exe'
+          Copy-Item 'lemon_ai_composer.py' 'Lemon-Studio-FR-Modern\lemon_ai_composer.py'
+          Copy-Item 'lemon_composer_core.py' 'Lemon-Studio-FR-Modern\lemon_composer_core.py'
+          @'
+          LEMON STUDIO FR — IA MODERN MIX V0.6 (EXPERIMENTAL)
+
+          1. Decompresser entierement l archive.
+          2. Fermer les anciennes fenetres Lemon Studio.
+          3. Lancer Lemon-Studio-Compositeur-Modern-IA.exe (PAS lemonstudio.exe).
+          4. Selectionner Ollama / modele qwen2.5:7b-instruct.
+          5. Pour composer : 1 prompt, recherche automatique des packs et accord unique.
+          6. Pour corriger le volume d un projet V0.5 : OUVRIR le projet,
+             cliquer Reequilibrer volume du projet V0.5, confirmer.
+          7. Tester d abord a FAIBLE volume casque/enceintes, surveiller le vu-metre.
+          8. Enregistrer une COPIE du projet.
+
+          NEW V0.6 : niveau du master remis a unity (0.8), gains canaux reduits
+          moins fortement qu en V0.5. Pas de limiteur ni de mastering automatique.
+          Frenchcore : hooks plus tot, builds progressifs, rolls, break reel,
+          Drop A/Drop B differents, outro courte.
+          Reggae roots : One Drop ; reggae disco rapide : backbeat anime.
+          Packs locaux non modifies. Le moteur ne sait pas ecouter perceptivement
+          les samples et ne garantit PAS un mix sans clipping.
+          Ceci reste une MAQUETTE, pas une production commerciale finalisee.
+          '@ | Set-Content -LiteralPath 'Lemon-Studio-FR-Modern\LISEZ-MOI-MODERN-MIX-V06.txt' -Encoding utf8
+      - name: Publier le ZIP Windows Modern Mix V0.6
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lemon-Studio-FR-IA-Modern-Mix-V06-Windows-x64
+          path: Lemon-Studio-FR-Modern/
+          if-no-files-found: error
+          retention-days: 14
